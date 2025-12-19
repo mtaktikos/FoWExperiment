@@ -60,7 +60,7 @@ def sq_to_alg(sq):
 def parse_extended_fen(fen, player_side):
     parts = fen.split()
     placement = parts[0]
-    side = WHITE if len(parts) > 1 and parts[1] == 'w' else BLACK
+    side = BLACK if len(parts) > 1 and parts[1] == 'b' else WHITE
     castling = parts[2] if len(parts) > 2 else '-'
     ep = parts[3] if len(parts) > 3 else '-'
     half = int(parts[4]) if len(parts) > 4 else 0
