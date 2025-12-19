@@ -321,47 +321,44 @@ def search(observed_board, player_side, time_limit=5.0):
 
 
     for move in possible_moves:
-        win = draw = loss = 0
+        move_win = move_draw = move_loss = 0
         for world in worlds:
             # Apply move in world (assume legal, since pseudo on observed)
             new_world, captured = make_move(world, move)
             opp_side = 1 - player_side
             if king_captured(new_world, opp_side):
-                win += 1
+                move_win += 1
                 continue  # immediate win
 
 
             # Now opponent plays in this world
             opp_moves = generate_moves(new_world, opp_side)
             if not opp_moves:
-                loss += 1  # opponent stalemated? wait, stalemate wins for us
+                move_loss += 1  # opponent stalemated? wait, stalemate wins for us
                 continue
 
 
             for _ in range(samples_per_move):
                 outcome = rollout(new_world, player_side, depth=15)  # from our perspective after opp move? wait adjust
                 if outcome > 0.1:
-                    win += 1
+                    move_win += 1
                 elif outcome < -0.1:
-                    loss += 1
+                    move_loss += 1
                 else:
-                    draw += 1
+                    move_draw += 1
 
 
-        total = win + draw + loss
+        total = move_win + move_draw + move_loss
         if total > 0:
-            score = (win + 0.5 * draw) / total
+            score = (move_win + 0.5 * move_draw) / total
             move_scores[move] = score
             move_counts[move] = total
 
 
     best_move = max(move_scores, key=move_scores.get)
-    prob_win = move_scores[best_move]
-    prob_draw = (move_counts[best_move] - (win + loss))
-    # Rough estimate
-    total_s = sum(move_counts.values())
-    est_win = prob_win
-    est_loss = 1 - prob_win - 0.1  # rough
+    # Rough estimate of probabilities
+    est_win = move_scores[best_move]
+    est_loss = 1 - est_win - 0.1  # rough
     est_draw = 0.1
 
 
@@ -371,12 +368,37 @@ def search(observed_board, player_side, time_limit=5.0):
     return best_move
 
 
+# Draw the board in a human-readable format
+def draw_board(board):
+    """Draw the board from white's perspective (rank 8 at top)"""
+    lines = []
+    lines.append("  +---+---+---+---+---+---+---+---+")
+    for rank in range(7, -1, -1):  # 8 to 1
+        row = f"{rank+1} |"
+        for file in range(8):  # a to h
+            sq = rank * 16 + file
+            piece = board[sq]
+            if piece == 0:
+                char = ' '
+            elif piece > 0:  # white
+                char = PIECE_CHARS[piece]
+            else:  # black
+                char = PIECE_CHARS[-piece].lower()
+            row += f" {char} |"
+        lines.append(row)
+        lines.append("  +---+---+---+---+---+---+---+---+")
+    lines.append("    a   b   c   d   e   f   g   h")
+    return "\n".join(lines)
+
+
 # Main engine loop (XBoard protocol)
 def main():
     print("feature ping=1 myname=\"GrokFoW v0.1\" done=1", flush=True)
     observed_board = None
     player_side = None
+    side_to_move = WHITE  # track which side is to move
     force_mode = False
+    time_per_move = 5.0  # default time per move in seconds
 
 
     while True:
@@ -402,20 +424,22 @@ def main():
             # determine player side? In analysis, we are analyzer, but for play, wait
             # For now, assume the side to move is opponent just gave us the position after their move
             # User will use force mode for analysis
-            observed_board, side_to_move, _, _, _, _ = parse_extended_fen(fen, None)  # player_side later
+            observed_board, side_to_move, _, _, _, _ = parse_extended_fen(fen, player_side)  # player_side can be None for now
             print("Hint: position set", flush=True)
         elif cmd[0] == "force":
             force_mode = True
         elif cmd[0] == "go":
             force_mode = False
             player_side = side_to_move  # current to move is us
-            best = search(observed_board, player_side)
+            best = search(observed_board, player_side, time_limit=time_per_move)
             if best:
                 prom_char = ""
                 if best[2]:
                     prom_char = PIECE_CHARS[best[2]].lower()
                 move_str = sq_to_alg(best[0]) + sq_to_alg(best[1]) + prom_char
                 print("move " + move_str, flush=True)
+                # Update side to move after our move
+                side_to_move = 1 - side_to_move
         elif cmd[0] == "usermove" or cmd[0] == "move":  # usermove in old
             usermove = cmd[1]
             fr = alg_to_sq(usermove[0:2])
@@ -426,9 +450,43 @@ def main():
             move = (fr, to, prom)
             if observed_board:
                 observed_board, _ = make_move(observed_board, move)
+                # Update side to move after opponent's move
+                side_to_move = 1 - side_to_move
                 # Update observations? For simplified, we don't update visibility here, assume user provides updated fen after opponent
         elif cmd[0] == "ping":
             print("pong " + cmd[1], flush=True)
+        elif cmd[0] == "d":
+            # Draw the board
+            if observed_board:
+                print(draw_board(observed_board), flush=True)
+            else:
+                print("# No board set. Use 'setboard' first.", flush=True)
+        elif cmd[0] == "st":
+            # Set time per move in seconds
+            if len(cmd) > 1:
+                try:
+                    time_per_move = float(cmd[1])
+                    print(f"# Time per move set to {time_per_move} seconds", flush=True)
+                except ValueError:
+                    print("# Error: st requires a numeric argument", flush=True)
+            else:
+                print("# Error: st requires time in seconds", flush=True)
+        elif cmd[0] == "help":
+            # Display available commands
+            help_text = """# Available commands:
+# xboard         - Enable XBoard mode
+# protover N     - Set protocol version
+# new            - Start new game
+# setboard FEN   - Set position from extended FEN (with 'f' for fog squares)
+# force          - Enter force mode (do not think)
+# go             - Start thinking and make a move
+# usermove MOVE  - Receive opponent's move (e.g., usermove e2e4)
+# d              - Draw the current board
+# st TIME        - Set time per move in seconds (default: 5.0)
+# ping N         - Ping (responds with pong N)
+# help           - Show this help message
+# quit           - Exit the engine"""
+            print(help_text, flush=True)
         elif cmd[0] == "quit":
             break
 
