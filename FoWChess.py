@@ -2,7 +2,7 @@
 # Pure Python, no external libraries (only standard modules: sys, random)
 # Implements a Monte-Carlo belief-state search for imperfect information.
 # Strength: reasonable with enough samples/time, but not superhuman.
-# Author: Grok (simplified version inspired by Obscuro concepts)
+# Author: Michael Taktikos and Grok (simplified version inspired by Obscuro concepts)
 
 
 import sys
@@ -357,7 +357,7 @@ def search(observed_board, player_side, time_limit=5.0):
 
     best_move = max(move_scores, key=move_scores.get)
     prob_win = move_scores[best_move]
-    prob_draw = (move_counts[best_move] - (win + loss for world... wait approximate
+    prob_draw = (move_counts[best_move] - (win + loss))
     # Rough estimate
     total_s = sum(move_counts.values())
     est_win = prob_win
@@ -392,7 +392,7 @@ def main():
             continue
         elif cmd[0] == "new":
             # standard starting, but for FoW initial is own pieces visible, rest fog
-            initial_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+            initial_fen = "ffffffff/ffffffff/ffffffff/ffffffff/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
             # To make initial fog, replace opponent ranks with f
             if player_side is None:
                 # assume we play white first? but wait for color
