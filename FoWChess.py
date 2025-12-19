@@ -12,6 +12,7 @@ import time
 
 # Constants
 EMPTY = 0
+FOG = 99  # Special marker for fog squares
 PAWN = 1
 KNIGHT = 2
 BISHOP = 3
@@ -89,7 +90,7 @@ def parse_extended_fen(fen, player_side):
             file += 1
         elif c.lower() == 'f':
             sq = rank * 16 + file
-            board[sq] = 0  # fog -> treated as possibly empty or opponent
+            board[sq] = FOG  # fog -> treated as possibly empty or opponent
             file += 1
         else:
             # invalid, ignore
@@ -115,25 +116,25 @@ def generate_moves(board, side):
 
 
         if ptype == PAWN:
-            dir = -16 if side == WHITE else 16
-            start_rank = 6 if side == WHITE else 1
+            dir = 16 if side == WHITE else -16
+            start_rank = 1 if side == WHITE else 6
             rank = sq >> 4
             # single push
             tgt = sq + dir
-            if on_board(tgt) and board[tgt] == 0:
-                if rank == (1 if side == WHITE else 6):  # promotion rank opposite
+            if on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG):
+                if rank == (6 if side == WHITE else 1):  # promotion rank (rank 7 for white, rank 2 for black)
                     for prom in [QUEEN, ROOK, BISHOP, KNIGHT]:
                         moves.append((sq, tgt, prom))
                 else:
                     moves.append((sq, tgt, 0))
                 # double push
-                if (rank == start_rank) and board[tgt + dir] == 0:
+                if (rank == start_rank) and (board[tgt + dir] == 0 or board[tgt + dir] == FOG):
                     moves.append((sq, tgt + dir, 0))
             # captures
             for cap_dir in [dir - 1, dir + 1]:
                 tgt = sq + cap_dir
-                if on_board(tgt) and board[tgt] != 0 and (board[tgt] > 0) != (side == WHITE):
-                    if rank == (1 if side == WHITE else 6):
+                if on_board(tgt) and board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE):
+                    if rank == (6 if side == WHITE else 1):
                         for prom in [QUEEN, ROOK, BISHOP, KNIGHT]:
                             moves.append((sq, tgt, prom))
                     else:
@@ -141,47 +142,47 @@ def generate_moves(board, side):
         elif ptype == KNIGHT:
             for d in KNIGHT_DELTAS:
                 tgt = sq + d
-                if on_board(tgt) and (board[tgt] == 0 or (board[tgt] > 0) != (side == WHITE)):
+                if on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG or (board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE))):
                     moves.append((sq, tgt, 0))
         elif ptype == BISHOP:
             for d in BISHOP_DELTAS:
                 tgt = sq + d
-                while on_board(tgt) and board[tgt] == 0:
+                while on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG):
                     moves.append((sq, tgt, 0))
                     tgt += d
-                if on_board(tgt) and (board[tgt] > 0) != (side == WHITE):
+                if on_board(tgt) and board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE):
                     moves.append((sq, tgt, 0))
         elif ptype == ROOK:
             for d in ROOK_DELTAS:
                 tgt = sq + d
-                while on_board(tgt) and board[tgt] == 0:
+                while on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG):
                     moves.append((sq, tgt, 0))
                     tgt += d
-                if on_board(tgt) and (board[tgt] > 0) != (side == WHITE):
+                if on_board(tgt) and board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE):
                     moves.append((sq, tgt, 0))
         elif ptype == QUEEN:
             for d in QUEEN_DELTAS:
                 tgt = sq + d
-                while on_board(tgt) and board[tgt] == 0:
+                while on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG):
                     moves.append((sq, tgt, 0))
                     tgt += d
-                if on_board(tgt) and (board[tgt] > 0) != (side == WHITE):
+                if on_board(tgt) and board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE):
                     moves.append((sq, tgt, 0))
         elif ptype == KING:
             for d in KING_DELTAS:
                 tgt = sq + d
-                if on_board(tgt) and (board[tgt] == 0 or (board[tgt] > 0) != (side == WHITE)):
+                if on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG or (board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE))):
                     moves.append((sq, tgt, 0))
             # Castling (simplified, ignore if rights lost or path blocked for now - can add later)
             if side == WHITE:
-                if board[116] == ROOK * 1 and board[117] == 0 and board[118] == 0:  # kingside
+                if board[116] == ROOK * 1 and (board[117] == 0 or board[117] == FOG) and (board[118] == 0 or board[118] == FOG):  # kingside
                     moves.append((sq, sq+2, 0))  # special, handle in make
-                if board[112] == ROOK * 1 and board[113] == 0 and board[114] == 0 and board[115] == 0:  # queenside
+                if board[112] == ROOK * 1 and (board[113] == 0 or board[113] == FOG) and (board[114] == 0 or board[114] == FOG) and (board[115] == 0 or board[115] == FOG):  # queenside
                     moves.append((sq, sq-2, 0))
             else:
-                if board[4] == ROOK * -1 and board[5] == 0 and board[6] == 0:
+                if board[4] == ROOK * -1 and (board[5] == 0 or board[5] == FOG) and (board[6] == 0 or board[6] == FOG):
                     moves.append((sq, sq+2, 0))
-                if board[0] == ROOK * -1 and board[1] == 0 and board[2] == 0 and board[3] == 0:
+                if board[0] == ROOK * -1 and (board[1] == 0 or board[1] == FOG) and (board[2] == 0 or board[2] == FOG) and (board[3] == 0 or board[3] == FOG):
                     moves.append((sq, sq-2, 0))
 
 
@@ -217,7 +218,7 @@ def evaluate(board, side):
     for sq in range(120):
         if on_board(sq):
             p = board[sq]
-            if p != 0:
+            if p != 0 and p != FOG:
                 val = values[abs(p)]
                 if (p > 0) == (side == WHITE):
                     mat += val
@@ -249,7 +250,7 @@ def sample_worlds(observed_board, player_side, num_samples=100):
 
 
     # Fog squares
-    fog_squares = [sq for sq in range(120) if on_board(sq) and observed_board[sq] == 0]
+    fog_squares = [sq for sq in range(120) if on_board(sq) and (observed_board[sq] == 0 or observed_board[sq] == FOG)]
 
 
     # To make sampling tractable, we assume standard material and place opponent pieces randomly in fog,
@@ -378,7 +379,9 @@ def draw_board(board):
         for file in range(8):  # a to h
             sq = rank * 16 + file
             piece = board[sq]
-            if piece == 0:
+            if piece == FOG:
+                char = 'f'
+            elif piece == 0:
                 char = ' '
             elif piece > 0:  # white
                 char = PIECE_CHARS[piece]
