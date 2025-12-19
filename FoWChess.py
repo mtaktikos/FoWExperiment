@@ -63,7 +63,9 @@ def parse_extended_fen(fen, player_side):
     parts = fen.split()
     placement = parts[0]
     
-    # Parse pieces in hand from placement (format: ranks[whitePieces][blackPieces])
+    # Parse pieces in hand from placement (format: ranks[pieces])
+    # Uppercase = White pieces captured (by Black), go to Black's hand
+    # Lowercase = Black pieces captured (by White), go to White's hand
     white_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
     black_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
     
@@ -75,8 +77,7 @@ def parse_extended_fen(fen, player_side):
         hand_part = placement[bracket_start:]
         
         # Parse pieces in hand
-        # Format: [WhitePieces][BlackPieces] or [WhitePiecesBlackPieces]
-        # We'll parse all pieces in the brackets
+        # Format: [pieces] where case indicates which color was captured
         in_bracket = False
         for c in hand_part:
             if c == '[':
@@ -85,10 +86,10 @@ def parse_extended_fen(fen, player_side):
                 in_bracket = False
             elif in_bracket and c.upper() in 'PNBRQK':
                 ptype = " PNBRQK".index(c.upper())
-                if c.isupper():  # White piece
-                    white_in_hand[ptype] += 1
-                else:  # Black piece
+                if c.isupper():  # White piece captured -> goes to Black's hand
                     black_in_hand[ptype] += 1
+                else:  # Black piece captured -> goes to White's hand
+                    white_in_hand[ptype] += 1
         
         placement = board_part
     
