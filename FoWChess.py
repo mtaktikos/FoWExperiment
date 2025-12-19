@@ -356,12 +356,9 @@ def search(observed_board, player_side, time_limit=5.0):
 
 
     best_move = max(move_scores, key=move_scores.get)
-    prob_win = move_scores[best_move]
-    prob_draw = (move_counts[best_move] - (win + loss))
-    # Rough estimate
-    total_s = sum(move_counts.values())
-    est_win = prob_win
-    est_loss = 1 - prob_win - 0.1  # rough
+    # Rough estimate of probabilities
+    est_win = move_scores[best_move]
+    est_loss = 1 - est_win - 0.1  # rough
     est_draw = 0.1
 
 
