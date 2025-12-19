@@ -56,11 +56,42 @@ def sq_to_alg(sq):
 
 # Parse extended FEN (with 'f' for fog from player's view)
 # Returns: board (list of 120 ints: >0 white piece, <0 black piece, 0 empty/fog)
-# side_to_move, castling, ep_square (0x88), halfmove, fullmove
+# side_to_move, castling, ep_square (0x88), halfmove, fullmove, white_in_hand, black_in_hand
 # The board will have known own pieces, opponent pieces only if visible, else 0 for fog.
+# Pieces in hand are stored as dicts {piece_type: count}
 def parse_extended_fen(fen, player_side):
     parts = fen.split()
     placement = parts[0]
+    
+    # Parse pieces in hand from placement (format: ranks[whitePieces][blackPieces])
+    white_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
+    black_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
+    
+    # Check if there are brackets in the placement
+    if '[' in placement:
+        # Split board part from pieces in hand
+        bracket_start = placement.index('[')
+        board_part = placement[:bracket_start]
+        hand_part = placement[bracket_start:]
+        
+        # Parse pieces in hand
+        # Format: [WhitePieces][BlackPieces] or [WhitePiecesBlackPieces]
+        # We'll parse all pieces in the brackets
+        in_bracket = False
+        for c in hand_part:
+            if c == '[':
+                in_bracket = True
+            elif c == ']':
+                in_bracket = False
+            elif in_bracket and c.upper() in 'PNBRQK':
+                ptype = " PNBRQK".index(c.upper())
+                if c.isupper():  # White piece
+                    white_in_hand[ptype] += 1
+                else:  # Black piece
+                    black_in_hand[ptype] += 1
+        
+        placement = board_part
+    
     side = BLACK if len(parts) > 1 and parts[1] == 'b' else WHITE
     castling = parts[2] if len(parts) > 2 else '-'
     ep = parts[3] if len(parts) > 3 else '-'
@@ -101,7 +132,7 @@ def parse_extended_fen(fen, player_side):
     ep_sq = alg_to_sq(ep) if ep != '-' else -1
 
 
-    return board, side, castling, ep_sq, half, full
+    return board, side, castling, ep_sq, half, full, white_in_hand, black_in_hand
 
 
 # Generate all pseudo-legal moves from a full board state
@@ -236,11 +267,11 @@ def king_captured(board, side):
 # Sample possible worlds consistent with observed view
 # observed_board: known own pieces positive/negative, fog 0, known opponent if visible
 # player_side: the side we are playing
-def sample_worlds(observed_board, player_side, num_samples=100):
+# white_in_hand, black_in_hand: pieces captured by each side
+def sample_worlds(observed_board, player_side, white_in_hand, black_in_hand, num_samples=100):
     worlds = []
     own_sign = 1 if player_side == WHITE else -1
     opp_sign = -own_sign
-
 
     # First, collect all known own pieces
     own_pieces = []
@@ -248,38 +279,50 @@ def sample_worlds(observed_board, player_side, num_samples=100):
         if on_board(sq) and observed_board[sq] * own_sign > 0:
             own_pieces.append((sq, observed_board[sq]))
 
-
     # Fog squares
     fog_squares = [sq for sq in range(120) if on_board(sq) and (observed_board[sq] == 0 or observed_board[sq] == FOG)]
 
-
-    # To make sampling tractable, we assume standard material and place opponent pieces randomly in fog,
-    # but ensure no overlap with known own, and approximate standard counts.
-    # This is very approximate!
-    opp_counts = {PAWN: 8, KNIGHT: 2, BISHOP: 2, ROOK: 2, QUEEN: 1, KING: 1}
-
-
-    # Subtract any known opponent pieces (if visible captures)
+    # Calculate opponent pieces remaining using pieces in hand information
+    # Standard material: 8 pawns, 2 knights, 2 bishops, 2 rooks, 1 queen, 1 king
+    # Opponent pieces remaining = standard - (on_board + in_hand)
+    standard_material = {PAWN: 8, KNIGHT: 2, BISHOP: 2, ROOK: 2, QUEEN: 1, KING: 1}
+    
+    # Determine which pieces are in our hand (captured from opponent)
+    # and which are in opponent's hand (captured from us)
+    if player_side == WHITE:
+        our_hand = white_in_hand  # We captured these from black
+        opp_hand = black_in_hand  # Opponent captured these from us
+    else:
+        our_hand = black_in_hand  # We captured these from white
+        opp_hand = white_in_hand  # Opponent captured these from us
+    
+    # Count opponent pieces on board (visible ones)
+    opp_on_board = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
     for sq in range(120):
         if on_board(sq) and observed_board[sq] * opp_sign > 0:
             ptype = abs(observed_board[sq])
-            opp_counts[ptype] -= 1
-
+            opp_on_board[ptype] += 1
+    
+    # Opponent pieces remaining to place in fog = standard - (on_board + captured_by_us)
+    opp_counts = {}
+    for ptype in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING]:
+        remaining = standard_material[ptype] - opp_on_board[ptype] - our_hand[ptype]
+        opp_counts[ptype] = max(0, remaining)  # Can't be negative
 
     # Available squares for opponent
     available = [sq for sq in fog_squares if all(observed_board[sq] != own_sign * pt for pt in range(1,7))]  # not on own known
 
-
     for _ in range(num_samples):
         world = observed_board[:]  # start with known
         placed = []
+        avail_copy = available[:]  # make a copy for this sample
         for ptype, count in list(opp_counts.items()):
             for _ in range(count):
-                if not available: break
-                sq = random.choice(available)
+                if not avail_copy: break
+                sq = random.choice(avail_copy)
                 world[sq] = opp_sign * ptype
                 placed.append(sq)
-                available.remove(sq)
+                avail_copy.remove(sq)
         worlds.append(world)
     return worlds
 
@@ -301,9 +344,9 @@ def rollout(board, side, depth=20):
 
 
 # Search for best move using sampled worlds
-def search(observed_board, player_side, time_limit=5.0):
+def search(observed_board, player_side, white_in_hand, black_in_hand, time_limit=5.0):
     start_time = time.time()
-    worlds = sample_worlds(observed_board, player_side, num_samples=50)  # adjustable
+    worlds = sample_worlds(observed_board, player_side, white_in_hand, black_in_hand, num_samples=50)  # adjustable
 
 
     # Get possible observed moves (pseudo from observed)
@@ -402,6 +445,8 @@ def main():
     side_to_move = WHITE  # track which side is to move
     force_mode = False
     time_per_move = 5.0  # default time per move in seconds
+    white_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
+    black_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
 
 
     while True:
@@ -417,7 +462,7 @@ def main():
             continue
         elif cmd[0] == "new":
             # standard starting, but for FoW initial is own pieces visible, rest fog
-            initial_fen = "ffffffff/ffffffff/ffffffff/ffffffff/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+            initial_fen = "ffffffff/ffffffff/ffffffff/ffffffff/8/8/PPPPPPPP/RNBQKBNR[] w - - 0 1"
             # To make initial fog, replace opponent ranks with f
             if player_side is None:
                 # assume we play white first? but wait for color
@@ -427,14 +472,14 @@ def main():
             # determine player side? In analysis, we are analyzer, but for play, wait
             # For now, assume the side to move is opponent just gave us the position after their move
             # User will use force mode for analysis
-            observed_board, side_to_move, _, _, _, _ = parse_extended_fen(fen, player_side)  # player_side can be None for now
+            observed_board, side_to_move, _, _, _, _, white_in_hand, black_in_hand = parse_extended_fen(fen, player_side)  # player_side can be None for now
             print("Hint: position set", flush=True)
         elif cmd[0] == "force":
             force_mode = True
         elif cmd[0] == "go":
             force_mode = False
             player_side = side_to_move  # current to move is us
-            best = search(observed_board, player_side, time_limit=time_per_move)
+            best = search(observed_board, player_side, white_in_hand, black_in_hand, time_limit=time_per_move)
             if best:
                 prom_char = ""
                 if best[2]:
