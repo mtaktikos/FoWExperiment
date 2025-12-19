@@ -288,14 +288,8 @@ def sample_worlds(observed_board, player_side, white_in_hand, black_in_hand, num
     # Opponent pieces remaining = standard - (on_board + in_hand)
     standard_material = {PAWN: 8, KNIGHT: 2, BISHOP: 2, ROOK: 2, QUEEN: 1, KING: 1}
     
-    # Determine which pieces are in our hand (captured from opponent)
-    # and which are in opponent's hand (captured from us)
-    if player_side == WHITE:
-        our_hand = white_in_hand  # We captured these from black
-        opp_hand = black_in_hand  # Opponent captured these from us
-    else:
-        our_hand = black_in_hand  # We captured these from white
-        opp_hand = white_in_hand  # Opponent captured these from us
+    # Determine which pieces we captured from opponent
+    our_hand = white_in_hand if player_side == WHITE else black_in_hand
     
     # Count opponent pieces on board (visible ones)
     opp_on_board = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
