@@ -8,6 +8,7 @@
 import sys
 import random
 import time
+import math
 
 
 # Constants
@@ -32,6 +33,16 @@ BISHOP_DELTAS = [-9, -7, 7, 9]
 ROOK_DELTAS = [-8, -1, 1, 8]
 QUEEN_DELTAS = ROOK_DELTAS + BISHOP_DELTAS
 KING_DELTAS = QUEEN_DELTAS
+
+
+# IS-MCTS / Belief-state tuning constants
+UCB_EXPLORATION_CONSTANT = 1.41      # standard UCB1 sqrt(2) ≈ 1.41
+EVAL_NORMALIZATION_FACTOR = 200.0    # maps centipawn evaluation to [0, 1] range
+BELIEF_MIN_SIMS_PER_WORLD = 10       # floor on MCTS simulations per determinized world
+BELIEF_MAX_SIMS_PER_WORLD = 100      # cap on MCTS simulations per determinized world
+BELIEF_TOTAL_SIM_BUDGET = 300        # total simulation budget distributed across worlds
+BELIEF_REFILL_THRESHOLD = 0.5        # re-sample when surviving worlds fall below this fraction
+SAMPLING_ATTEMPT_MULTIPLIER = 15     # max_attempts = desired_worlds * this factor
 
 
 # Board is 120-element array (0-119), with 0x88 off-board detection
@@ -407,6 +418,419 @@ def search(observed_board, player_side, white_in_hand, black_in_hand, time_limit
     return best_move
 
 
+# ============================================================
+# Belief State and IS-MCTS Implementation
+# Inspired by Sandholm's Obscuro concepts for FoW Chess
+# ============================================================
+
+
+class ObservationHistory:
+    """Tracks the sequence of fog-of-war FEN observations and the moves that followed them."""
+
+    def __init__(self, player_side):
+        self.player_side = player_side
+        # Each entry: {'fog_fen': str, 'move': tuple or None}
+        self.entries = []
+
+    def add_observation(self, fog_fen):
+        self.entries.append({'fog_fen': fog_fen, 'move': None})
+
+    def record_move(self, move):
+        """Attach a move to the most recent observation."""
+        if self.entries:
+            self.entries[-1]['move'] = move
+
+    def latest_fog_fen(self):
+        return self.entries[-1]['fog_fen'] if self.entries else None
+
+
+def _is_world_consistent(world, observed_board, player_side):
+    """
+    Return True if *world* (a fully-specified board) is compatible with
+    *observed_board* (which may contain FOG markers):
+
+    * Squares where observed_board[sq] != FOG must match world[sq] exactly.
+    * FOG squares may contain any opponent piece or be empty, but NOT our
+      own pieces (those would be visible to us).
+    """
+    own_sign = 1 if player_side == WHITE else -1
+    for sq in range(120):
+        if not on_board(sq):
+            continue
+        obs = observed_board[sq]
+        wld = world[sq]
+        if obs == FOG:
+            # Our own piece must never hide in fog
+            if wld * own_sign > 0:
+                return False
+        else:
+            if obs != wld:
+                return False
+    return True
+
+
+def enumerate_worlds(observed_board, player_side, white_in_hand, black_in_hand,
+                     max_worlds=200):
+    """
+    Sample up to *max_worlds* complete board states (determinizations) that
+    are consistent with *observed_board*.
+
+    Strategy:
+      1. Identify FOG squares – the only candidates for hidden opponent pieces.
+      2. Compute how many of each opponent piece type still remain unaccounted
+         for (standard starting count minus visible board count minus captured).
+      3. Randomly assign those remaining pieces to FOG squares.
+      4. Verify consistency and deduplicate.
+    """
+    own_sign = 1 if player_side == WHITE else -1
+    opp_sign = -own_sign
+
+    standard_material = {PAWN: 8, KNIGHT: 2, BISHOP: 2, ROOK: 2, QUEEN: 1, KING: 1}
+
+    # Count opponent pieces that are directly visible on the observed board
+    opp_on_board = {pt: 0 for pt in standard_material}
+    for sq in range(120):
+        if on_board(sq) and observed_board[sq] * opp_sign > 0:
+            ptype = abs(observed_board[sq])
+            if ptype in opp_on_board:
+                opp_on_board[ptype] += 1
+
+    # Pieces we captured from the opponent (they sit in our hand)
+    our_hand = white_in_hand if player_side == WHITE else black_in_hand
+
+    # Build the list of opponent piece types that still need placing in fog
+    opp_remaining = []
+    for ptype in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING]:
+        count = standard_material[ptype] - opp_on_board[ptype] - our_hand[ptype]
+        opp_remaining.extend([ptype] * max(0, count))
+
+    # Only FOG-marked squares are candidates (squares we genuinely cannot see)
+    fog_sqs = [sq for sq in range(120) if on_board(sq) and observed_board[sq] == FOG]
+
+    worlds = []
+    seen_hashes = set()
+    max_attempts = max_worlds * SAMPLING_ATTEMPT_MULTIPLIER
+
+    for _ in range(max_attempts):
+        if len(worlds) >= max_worlds:
+            break
+        if opp_remaining and not fog_sqs:
+            break
+        if len(opp_remaining) > len(fog_sqs):
+            # More pieces than available fog squares – give up sampling
+            break
+
+        # Build world: copy observed board, replace FOG squares with 0 first
+        world = observed_board[:]
+        for sq in fog_sqs:
+            world[sq] = 0
+
+        # Randomly place remaining opponent pieces into fog squares
+        avail = fog_sqs[:]
+        random.shuffle(avail)
+        for ptype in opp_remaining:
+            sq = avail.pop()
+            world[sq] = opp_sign * ptype
+
+        # Verify consistency (guards against edge cases after move propagation)
+        if not _is_world_consistent(world, observed_board, player_side):
+            continue
+
+        key = tuple(world)
+        if key in seen_hashes:
+            continue
+        seen_hashes.add(key)
+        worlds.append(world)
+
+    # Fallback to the original sampler if enumeration yielded nothing
+    if not worlds:
+        worlds = sample_worlds(observed_board, player_side,
+                               white_in_hand, black_in_hand, max_worlds)
+    return worlds
+
+
+class BeliefState:
+    """
+    Maintains a set P of consistent positions (the belief state) for FoW chess.
+
+    After each new fog_fen observation the set is updated:
+      * Existing worlds that contradict the new observation are discarded.
+      * If too few worlds remain, fresh ones are sampled by enumerate_worlds.
+
+    After each move (ours or opponent's) every world in P is advanced by that
+    move so the set stays in sync with the current game state.
+    """
+
+    def __init__(self, player_side, max_worlds=100):
+        self.player_side = player_side
+        self.max_worlds = max_worlds
+        self.observation_history = ObservationHistory(player_side)
+        self.worlds = []          # list of fully-specified board states
+        self._last_wih = {pt: 0 for pt in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING]}
+        self._last_bih = {pt: 0 for pt in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING]}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update_observation(self, fog_fen):
+        """
+        Incorporate a new fog_fen observation.
+
+        Returns the parsed observed board, white_in_hand, black_in_hand so
+        callers do not have to parse the FEN a second time.
+        """
+        self.observation_history.add_observation(fog_fen)
+        board, _side, _cast, _ep, _half, _full, wih, bih = parse_extended_fen(
+            fog_fen, self.player_side)
+        self._last_wih = wih
+        self._last_bih = bih
+
+        # Keep worlds that remain consistent with the new observation
+        consistent = [w for w in self.worlds
+                      if _is_world_consistent(w, board, self.player_side)]
+
+        refill_threshold = int(self.max_worlds * BELIEF_REFILL_THRESHOLD)
+        if len(consistent) >= refill_threshold:
+            self.worlds = consistent[:self.max_worlds]
+        else:
+            # Re-sample and merge with surviving worlds
+            fresh = enumerate_worlds(board, self.player_side, wih, bih,
+                                     self.max_worlds)
+            combined = consistent + fresh
+            seen = set()
+            deduped = []
+            for w in combined:
+                k = tuple(w)
+                if k not in seen:
+                    seen.add(k)
+                    deduped.append(w)
+            self.worlds = deduped[:self.max_worlds]
+
+        return board, wih, bih
+
+    def propagate_our_move(self, move):
+        """Advance every world through *move* (our move) and record it."""
+        self.observation_history.record_move(move)
+        self.worlds = self._apply_move_to_all(move)
+
+    def propagate_opponent_move(self, move):
+        """Advance every world through the opponent's *move*."""
+        self.worlds = self._apply_move_to_all(move)
+
+    def sample(self, n=None):
+        """Return up to *n* worlds (all if n is None or exceeds pool size)."""
+        if not self.worlds:
+            return []
+        if n is None or n >= len(self.worlds):
+            return list(self.worlds)
+        return random.sample(self.worlds, n)
+
+    def size(self):
+        return len(self.worlds)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _apply_move_to_all(self, move):
+        new_worlds = []
+        for world in self.worlds:
+            try:
+                new_world, _ = make_move(world, move)
+                new_worlds.append(new_world)
+            except Exception:
+                # Keep the world unchanged if make_move raises (e.g. illegal
+                # move in this particular determinization).  The world will be
+                # filtered out on the next observation update if it becomes
+                # inconsistent with reality.
+                new_worlds.append(world)
+        return new_worlds
+
+
+# ============================================================
+# MCTS for FoW Chess  (IS-MCTS – Information Set MCTS)
+# ============================================================
+
+
+class MCTSNode:
+    """Single node in an MCTS tree built for one determinized world."""
+
+    __slots__ = ('board', 'side', 'parent', 'move', 'children',
+                 'visits', 'wins', 'untried_moves')
+
+    def __init__(self, board, side, parent=None, move=None):
+        self.board = board
+        self.side = side          # side to move at this node
+        self.parent = parent
+        self.move = move          # move that led here from parent
+        self.children = {}        # move -> MCTSNode
+        self.visits = 0
+        self.wins = 0.0           # wins counted from root_side's perspective
+        moves = generate_moves(board, side)
+        random.shuffle(moves)
+        self.untried_moves = moves
+
+    def is_terminal(self):
+        return king_captured(self.board, WHITE) or king_captured(self.board, BLACK)
+
+    def is_fully_expanded(self):
+        return len(self.untried_moves) == 0
+
+    def ucb_score(self, root_side, exploration=UCB_EXPLORATION_CONSTANT):
+        """UCB1 score viewed from this node's parent's perspective."""
+        if self.visits == 0:
+            return float('inf')
+        parent_visits = self.parent.visits if self.parent else 1
+        if parent_visits == 0:
+            return float('inf')
+        # wins is tracked from root_side's perspective; if the parent is
+        # root_side, we maximise wins; otherwise we maximise (1 - wins).
+        win_rate = self.wins / self.visits
+        if self.parent is not None and self.parent.side != root_side:
+            win_rate = 1.0 - win_rate
+        explore = exploration * math.sqrt(math.log(parent_visits) / self.visits)
+        return win_rate + explore
+
+    def best_child(self, root_side, exploration=UCB_EXPLORATION_CONSTANT):
+        return max(self.children.values(),
+                   key=lambda c: c.ucb_score(root_side, exploration))
+
+    def expand(self):
+        move = self.untried_moves.pop()
+        new_board, _ = make_move(self.board, move)
+        child = MCTSNode(new_board, 1 - self.side, parent=self, move=move)
+        self.children[move] = child
+        return child
+
+
+def mcts_rollout(board, side, root_side, depth=20):
+    """
+    Random rollout from *board* (with *side* to move).
+    Returns a value in [0, 1] from *root_side*'s perspective.
+    """
+    current = side
+    b = board[:]
+    for _ in range(depth):
+        moves = generate_moves(b, current)
+        if not moves:
+            return 0.5  # stalemate – treat as draw
+        move = random.choice(moves)
+        b, _ = make_move(b, move)
+        if king_captured(b, 1 - current):
+            return 1.0 if current == root_side else 0.0
+        current = 1 - current
+    # Depth exhausted – use material heuristic normalised to [0, 1]
+    val = evaluate(b, root_side)
+    return max(0.0, min(1.0, 0.5 + val / EVAL_NORMALIZATION_FACTOR))
+
+
+def mcts_in_world(root_board, player_side, num_simulations=50):
+    """
+    Run MCTS in a single determinized world.
+
+    Returns a dict  move -> (total_wins, total_visits)  for the root's
+    immediate children.  *wins* is always from *player_side*'s perspective.
+    """
+    root = MCTSNode(root_board, player_side)
+
+    for _ in range(num_simulations):
+        node = root
+
+        # ---- Selection ----
+        while (node.is_fully_expanded()
+               and node.children
+               and not node.is_terminal()):
+            node = node.best_child(player_side)
+
+        # ---- Terminal handling ----
+        if node.is_terminal():
+            if king_captured(node.board, player_side):
+                result = 0.0
+            elif king_captured(node.board, 1 - player_side):
+                result = 1.0
+            else:
+                result = 0.5
+        else:
+            # ---- Expansion ----
+            if not node.is_fully_expanded() and node.untried_moves:
+                node = node.expand()
+            # ---- Simulation ----
+            result = mcts_rollout(node.board, node.side, player_side)
+
+        # ---- Backpropagation (iterative) ----
+        n = node
+        while n is not None:
+            n.visits += 1
+            n.wins += result
+            n = n.parent
+
+    # Collect statistics for root's children
+    return {move: (child.wins, child.visits)
+            for move, child in root.children.items()}
+
+
+def belief_state_mcts(belief_state, observed_board, player_side, time_limit=5.0):
+    """
+    IS-MCTS (Information Set MCTS) over the full belief state.
+
+    For each world in the belief state a separate MCTS tree is grown.
+    Move statistics (wins / visits) are aggregated across all worlds and the
+    move with the highest combined win-rate is returned.
+
+    This is the core of the Obscuro-style belief-state search described by
+    Sandholm: enumerate consistent worlds, run search in each, pick the move
+    that performs best on average across all consistent positions.
+    """
+    start_time = time.time()
+
+    # Candidate moves come from the observed (partially foggy) board
+    candidate_moves = generate_moves(observed_board, player_side)
+    if not candidate_moves:
+        return None
+
+    # Use worlds stored in the belief state; fall back to the observed board
+    worlds = belief_state.sample() if belief_state.size() > 0 else [observed_board]
+    n_worlds = len(worlds)
+
+    # Simulations per world: more worlds → fewer sims each to stay within budget
+    sims_per_world = max(BELIEF_MIN_SIMS_PER_WORLD,
+                         min(BELIEF_MAX_SIMS_PER_WORLD,
+                             BELIEF_TOTAL_SIM_BUDGET // max(1, n_worlds)))
+
+    # Aggregate statistics: move -> [total_wins, total_visits]
+    global_stats = {m: [0.0, 0] for m in candidate_moves}
+
+    for world in worlds:
+        if time.time() - start_time > time_limit:
+            break
+        move_stats = mcts_in_world(world, player_side, num_simulations=sims_per_world)
+        for move, (wins, visits) in move_stats.items():
+            if move in global_stats:
+                global_stats[move][0] += wins
+                global_stats[move][1] += visits
+            else:
+                global_stats[move] = [wins, visits]
+
+    # Pick the best-evaluated move (highest win-rate among visited moves)
+    evaluated = {m: s for m, s in global_stats.items() if s[1] > 0}
+    if not evaluated:
+        return candidate_moves[0]  # fallback
+
+    best_move = max(evaluated, key=lambda m: evaluated[m][0] / evaluated[m][1])
+    best_wins, best_total = global_stats[best_move]
+    best_score = best_wins / best_total if best_total > 0 else 0.0
+    total_visits = sum(s[1] for s in global_stats.values())
+    elapsed = time.time() - start_time
+
+    print(f"# IS-MCTS: {n_worlds} worlds, {total_visits} sims, "
+          f"{elapsed:.2f}s", flush=True)
+    print(f"# Best move {sq_to_alg(best_move[0])}{sq_to_alg(best_move[1])}, "
+          f"est win rate {best_score:.2f}", flush=True)
+
+    return best_move
+
+
 # Draw the board in a human-readable format
 def draw_board(board):
     """Draw the board from white's perspective (rank 8 at top)"""
@@ -443,6 +867,11 @@ def main():
     white_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
     black_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
 
+    # Belief state – initialised lazily once we know which side we play
+    belief = None
+
+
+    last_fen = None   # most recently received setboard FEN string
 
     while True:
         line = sys.stdin.readline().strip()
@@ -464,23 +893,52 @@ def main():
                 pass
         elif cmd[0] == "setboard":
             fen = " ".join(cmd[1:])
-            # determine player side? In analysis, we are analyzer, but for play, wait
-            # For now, assume the side to move is opponent just gave us the position after their move
-            # User will use force mode for analysis
-            observed_board, side_to_move, _, _, _, _, white_in_hand, black_in_hand = parse_extended_fen(fen, player_side)  # player_side can be None for now
+            last_fen = fen
+            # Parse once; if a belief state already exists update it from the
+            # same FEN so we avoid redundant parsing and keep history intact.
+            if belief is not None:
+                observed_board, white_in_hand, black_in_hand = \
+                    belief.update_observation(fen)
+                # side_to_move comes from a fresh parse (belief doesn't expose it)
+                _, side_to_move, *_ = parse_extended_fen(fen, player_side)
+            else:
+                parsed = parse_extended_fen(fen, player_side)
+                observed_board = parsed[0]
+                side_to_move = parsed[1]
+                white_in_hand = parsed[6]
+                black_in_hand = parsed[7]
             print("Hint: position set", flush=True)
         elif cmd[0] == "force":
             force_mode = True
         elif cmd[0] == "go":
             force_mode = False
             player_side = side_to_move  # current to move is us
-            best = search(observed_board, player_side, white_in_hand, black_in_hand, time_limit=time_per_move)
+
+            # Ensure we have a belief state for this side; if player_side changed
+            # (e.g. engine switched from white to black), recreate it and seed it
+            # from the last known FEN so observation history is properly recorded.
+            if belief is None or belief.player_side != player_side:
+                belief = BeliefState(player_side, max_worlds=100)
+                if last_fen is not None:
+                    observed_board, white_in_hand, black_in_hand = \
+                        belief.update_observation(last_fen)
+                elif observed_board is not None:
+                    belief.worlds = enumerate_worlds(
+                        observed_board, player_side,
+                        white_in_hand, black_in_hand, 100)
+
+            best = belief_state_mcts(
+                belief, observed_board, player_side, time_limit=time_per_move)
             if best:
                 prom_char = ""
                 if best[2]:
                     prom_char = PIECE_CHARS[best[2]].lower()
                 move_str = sq_to_alg(best[0]) + sq_to_alg(best[1]) + prom_char
                 print("move " + move_str, flush=True)
+                # Propagate our move through the belief state
+                belief.propagate_our_move(best)
+                # Update the observed board locally too
+                observed_board, _ = make_move(observed_board, best)
                 # Update side to move after our move
                 side_to_move = 1 - side_to_move
         elif cmd[0] == "usermove" or cmd[0] == "move":  # usermove in old
@@ -493,6 +951,9 @@ def main():
             move = (fr, to, prom)
             if observed_board:
                 observed_board, _ = make_move(observed_board, move)
+                # Propagate opponent's move through belief state
+                if belief is not None:
+                    belief.propagate_opponent_move(move)
                 # Update side to move after opponent's move
                 side_to_move = 1 - side_to_move
                 # Update observations? For simplified, we don't update visibility here, assume user provides updated fen after opponent
