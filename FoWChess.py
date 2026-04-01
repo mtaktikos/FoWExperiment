@@ -28,10 +28,10 @@ BLACK = 1
 PIECE_CHARS = " PNBRQK"  # index 0 empty, 1-6 pieces
 
 
-# Directions for pieces
-KNIGHT_DELTAS = [-17, -15, -10, -6, 6, 10, 15, 17]
-BISHOP_DELTAS = [-9, -7, 7, 9]
-ROOK_DELTAS = [-8, -1, 1, 8]
+# Directions for pieces (0x88 board: rank*16 + file, so rank stride = 16)
+KNIGHT_DELTAS = [-33, -31, -18, -14, 14, 18, 31, 33]
+BISHOP_DELTAS = [-17, -15, 15, 17]
+ROOK_DELTAS = [-16, -1, 1, 16]
 QUEEN_DELTAS = ROOK_DELTAS + BISHOP_DELTAS
 KING_DELTAS = QUEEN_DELTAS
 
@@ -224,14 +224,14 @@ def generate_moves(board, side):
                     moves.append((sq, tgt, 0))
             # Castling (simplified, ignore if rights lost or path blocked for now - can add later)
             if side == WHITE:
-                if board[116] == ROOK * 1 and (board[117] == 0 or board[117] == FOG) and (board[118] == 0 or board[118] == FOG):  # kingside
+                if board[7] == ROOK * 1 and (board[5] == 0 or board[5] == FOG) and (board[6] == 0 or board[6] == FOG):  # kingside
                     moves.append((sq, sq+2, 0))  # special, handle in make
-                if board[112] == ROOK * 1 and (board[113] == 0 or board[113] == FOG) and (board[114] == 0 or board[114] == FOG) and (board[115] == 0 or board[115] == FOG):  # queenside
+                if board[0] == ROOK * 1 and (board[1] == 0 or board[1] == FOG) and (board[2] == 0 or board[2] == FOG) and (board[3] == 0 or board[3] == FOG):  # queenside
                     moves.append((sq, sq-2, 0))
             else:
-                if board[4] == ROOK * -1 and (board[5] == 0 or board[5] == FOG) and (board[6] == 0 or board[6] == FOG):
+                if board[119] == ROOK * -1 and (board[117] == 0 or board[117] == FOG) and (board[118] == 0 or board[118] == FOG):
                     moves.append((sq, sq+2, 0))
-                if board[0] == ROOK * -1 and (board[1] == 0 or board[1] == FOG) and (board[2] == 0 or board[2] == FOG) and (board[3] == 0 or board[3] == FOG):
+                if board[112] == ROOK * -1 and (board[113] == 0 or board[113] == FOG) and (board[114] == 0 or board[114] == FOG) and (board[115] == 0 or board[115] == FOG):
                     moves.append((sq, sq-2, 0))
 
 
@@ -251,12 +251,12 @@ def make_move(board, move):
         new_board[to] = piece
     # simple castling
     if abs(piece) == KING and abs(fr - to) == 2:
-        if to > fr:  # kingside
-            new_board[to + 1] = new_board[to - 1]
-            new_board[to - 1] = 0
-        else:
-            new_board[to - 2] = new_board[to + 1]
+        if to > fr:  # kingside: rook goes from to+1 (h-file) to to-1 (f-file)
+            new_board[to - 1] = new_board[to + 1]
             new_board[to + 1] = 0
+        else:  # queenside: rook goes from to-2 (a-file) to to+1 (d-file)
+            new_board[to + 1] = new_board[to - 2]
+            new_board[to - 2] = 0
     return new_board, captured
 
 
