@@ -39,8 +39,8 @@ KING_DELTAS = QUEEN_DELTAS
 UCB_EXPLORATION_CONSTANT = 1.41      # standard UCB1 sqrt(2) ≈ 1.41
 EVAL_NORMALIZATION_FACTOR = 200.0    # maps centipawn evaluation to [0, 1] range
 BELIEF_MIN_SIMS_PER_WORLD = 10       # floor on MCTS simulations per determinized world
-BELIEF_MAX_SIMS_PER_WORLD = 100      # cap on MCTS simulations per determinized world
-BELIEF_TOTAL_SIM_BUDGET = 300        # total simulation budget distributed across worlds
+BELIEF_MAX_SIMS_PER_WORLD = 300      # cap on MCTS simulations per determinized world
+BELIEF_TOTAL_SIM_BUDGET = 10000      # total simulation budget distributed across worlds
 BELIEF_REFILL_THRESHOLD = 0.5        # re-sample when surviving worlds fall below this fraction
 SAMPLING_ATTEMPT_MULTIPLIER = 15     # max_attempts = desired_worlds * this factor
 
@@ -858,12 +858,12 @@ def draw_board(board):
 
 # Main engine loop (XBoard protocol)
 def main():
-    print("feature ping=1 myname=\"GrokFoW v0.1\" done=1", flush=True)
+    print("feature ping=1 myname=\"FoWMT v0.1\" done=1", flush=True)
     observed_board = None
     player_side = None
     side_to_move = WHITE  # track which side is to move
     force_mode = False
-    time_per_move = 5.0  # default time per move in seconds
+    time_per_move = 15.0  # default time per move in seconds
     white_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
     black_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
 
