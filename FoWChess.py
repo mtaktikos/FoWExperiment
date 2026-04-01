@@ -1,8 +1,9 @@
 ﻿# Simplified Fog-of-War Chess Engine (XBoard protocol)
 # Pure Python, no external libraries (only standard modules: sys, random)
-# Implements a Monte-Carlo belief-state search for imperfect information.
-# Strength: reasonable with enough samples/time, but not superhuman.
-# Author: Michael Taktikos and Grok (simplified version inspired by Obscuro concepts)
+# Implements a belief-state search (IS-GRAVE) for imperfect information.
+# Algorithm: MC-GRAVE (Monte Carlo with Global AMAF Value Estimation),
+#            which outperforms plain IS-MCTS/UCT on imperfect-information games.
+# Author: Michael Taktikos and Grok (simplified version inspired by Obscuro/Ludii concepts)
 
 
 import sys
@@ -35,14 +36,19 @@ QUEEN_DELTAS = ROOK_DELTAS + BISHOP_DELTAS
 KING_DELTAS = QUEEN_DELTAS
 
 
-# IS-MCTS / Belief-state tuning constants
+# IS-GRAVE / Belief-state tuning constants
 UCB_EXPLORATION_CONSTANT = 1.41      # standard UCB1 sqrt(2) ≈ 1.41
 EVAL_NORMALIZATION_FACTOR = 200.0    # maps centipawn evaluation to [0, 1] range
-BELIEF_MIN_SIMS_PER_WORLD = 10       # floor on MCTS simulations per determinized world
-BELIEF_MAX_SIMS_PER_WORLD = 300      # cap on MCTS simulations per determinized world
+BELIEF_MIN_SIMS_PER_WORLD = 10       # floor on GRAVE simulations per determinized world
+BELIEF_MAX_SIMS_PER_WORLD = 300      # cap on GRAVE simulations per determinized world
 BELIEF_TOTAL_SIM_BUDGET = 10000      # total simulation budget distributed across worlds
 BELIEF_REFILL_THRESHOLD = 0.5        # re-sample when surviving worlds fall below this fraction
 SAMPLING_ATTEMPT_MULTIPLIER = 15     # max_attempts = desired_worlds * this factor
+
+# MC-GRAVE specific constants
+GRAVE_K = 250           # AMAF beta-mixing parameter: beta = sqrt(k / (3*n + k))
+                        # higher k -> more weight on AMAF early; lower k -> quicker UCB dominance
+GRAVE_REF_THRESHOLD = 50  # minimum visits before a node can serve as the GRAVE reference
 
 
 # Board is 120-element array (0-119), with 0x88 off-board detection
@@ -649,99 +655,154 @@ class BeliefState:
 
 
 # ============================================================
-# MCTS for FoW Chess  (IS-MCTS – Information Set MCTS)
+# MC-GRAVE for FoW Chess  (IS-GRAVE – Information Set MC-GRAVE)
+#
+# MC-GRAVE (Monte Carlo with Global AMAF Value Estimation) improves over
+# plain UCT/MCTS by maintaining AMAF (All Moves As First) statistics at
+# each tree node and using a β-weighted combination of UCB and AMAF when
+# selecting among children.  The "Global" part means the AMAF table of the
+# deepest sufficiently-visited ancestor (the *reference node*) is used for
+# nodes that have been visited fewer than GRAVE_REF_THRESHOLD times, giving
+# those new nodes better initial estimates from the richer ancestor.
 # ============================================================
 
 
-class MCTSNode:
-    """Single node in an MCTS tree built for one determinized world."""
+class GRAVENode:
+    """
+    MCTS node augmented with AMAF/GRAVE statistics.
+
+    amaf_wins[move]   – cumulative result for this side when *move* was
+                        played anywhere in a rollout that passed through
+                        this node.
+    amaf_visits[move] – how many such rollouts there were.
+    """
 
     __slots__ = ('board', 'side', 'parent', 'move', 'children',
-                 'visits', 'wins', 'untried_moves')
+                 'visits', 'wins', 'untried_moves',
+                 'amaf_wins', 'amaf_visits')
 
     def __init__(self, board, side, parent=None, move=None):
         self.board = board
         self.side = side          # side to move at this node
         self.parent = parent
-        self.move = move          # move that led here from parent
-        self.children = {}        # move -> MCTSNode
+        self.move = move          # move that led here from parent (None for root)
+        self.children = {}        # move -> GRAVENode
         self.visits = 0
-        self.wins = 0.0           # wins counted from root_side's perspective
+        self.wins = 0.0           # wins from root_side's perspective
         moves = generate_moves(board, side)
         random.shuffle(moves)
         self.untried_moves = moves
+        self.amaf_wins = {}       # move -> cumulative AMAF wins
+        self.amaf_visits = {}     # move -> AMAF visit count
 
     def is_terminal(self):
         return king_captured(self.board, WHITE) or king_captured(self.board, BLACK)
 
     def is_fully_expanded(self):
-        return len(self.untried_moves) == 0
+        return not self.untried_moves
 
-    def ucb_score(self, root_side, exploration=UCB_EXPLORATION_CONSTANT):
-        """UCB1 score viewed from this node's parent's perspective."""
-        if self.visits == 0:
+    def grave_ucb(self, child, ref_node, root_side,
+                  exploration=UCB_EXPLORATION_CONSTANT):
+        """
+        GRAVE-UCB score for *child* (reached by *child.move*).
+
+        Uses UCB1 combined with AMAF statistics from *ref_node* (the deepest
+        ancestor that has been visited >= GRAVE_REF_THRESHOLD times).
+        beta = sqrt(k / (3*n_child + k)) controls the AMAF weight; once n_child
+        grows large beta -> 0 and the score reduces to plain UCB.
+        """
+        if child.visits == 0:
             return float('inf')
-        parent_visits = self.parent.visits if self.parent else 1
-        if parent_visits == 0:
-            return float('inf')
-        # wins is tracked from root_side's perspective; if the parent is
-        # root_side, we maximise wins; otherwise we maximise (1 - wins).
-        win_rate = self.wins / self.visits
-        if self.parent is not None and self.parent.side != root_side:
+
+        # --- UCB component ---
+        win_rate = child.wins / child.visits
+        if self.side != root_side:          # opponent's turn → flip perspective
             win_rate = 1.0 - win_rate
-        explore = exploration * math.sqrt(math.log(parent_visits) / self.visits)
-        return win_rate + explore
+        explore = (exploration
+                   * math.sqrt(math.log(max(1, self.visits)) / child.visits))
+        ucb = win_rate + explore
 
-    def best_child(self, root_side, exploration=UCB_EXPLORATION_CONSTANT):
+        # --- AMAF component (from the GRAVE reference node) ---
+        m = child.move
+        amaf_v = ref_node.amaf_visits.get(m, 0)
+        if amaf_v == 0:
+            return ucb                          # no AMAF data yet → plain UCB
+        amaf_rate = ref_node.amaf_wins.get(m, 0.0) / amaf_v
+        if self.side != root_side:
+            amaf_rate = 1.0 - amaf_rate
+
+        beta = math.sqrt(GRAVE_K / (3.0 * child.visits + GRAVE_K))
+        return (1.0 - beta) * ucb + beta * amaf_rate
+
+    def best_child_grave(self, root_side, ref_node,
+                         exploration=UCB_EXPLORATION_CONSTANT):
         return max(self.children.values(),
-                   key=lambda c: c.ucb_score(root_side, exploration))
+                   key=lambda c: self.grave_ucb(c, ref_node, root_side, exploration))
 
     def expand(self):
         move = self.untried_moves.pop()
         new_board, _ = make_move(self.board, move)
-        child = MCTSNode(new_board, 1 - self.side, parent=self, move=move)
+        child = GRAVENode(new_board, 1 - self.side, parent=self, move=move)
         self.children[move] = child
         return child
 
 
-def mcts_rollout(board, side, root_side, depth=20):
+def grave_rollout(board, side, root_side, depth=20):
     """
-    Random rollout from *board* (with *side* to move).
-    Returns a value in [0, 1] from *root_side*'s perspective.
+    Random playout from *board* with *side* to move.
+
+    Returns (result, played) where:
+      result – float in [0, 1] from *root_side*'s perspective
+      played – list of (move, side) pairs in play order
     """
     current = side
     b = board[:]
+    played = []
     for _ in range(depth):
         moves = generate_moves(b, current)
         if not moves:
-            return 0.5  # stalemate – treat as draw
+            return 0.5, played          # stalemate → draw
         move = random.choice(moves)
+        played.append((move, current))
         b, _ = make_move(b, move)
         if king_captured(b, 1 - current):
-            return 1.0 if current == root_side else 0.0
+            result = 1.0 if current == root_side else 0.0
+            return result, played
         current = 1 - current
-    # Depth exhausted – use material heuristic normalised to [0, 1]
+    # Depth exhausted – material heuristic normalised to [0, 1]
     val = evaluate(b, root_side)
-    return max(0.0, min(1.0, 0.5 + val / EVAL_NORMALIZATION_FACTOR))
+    return max(0.0, min(1.0, 0.5 + val / EVAL_NORMALIZATION_FACTOR)), played
 
 
-def mcts_in_world(root_board, player_side, num_simulations=50):
+def grave_in_world(root_board, player_side, num_simulations=50):
     """
-    Run MCTS in a single determinized world.
+    Run MC-GRAVE inside one fully-determinized world.
 
-    Returns a dict  move -> (total_wins, total_visits)  for the root's
-    immediate children.  *wins* is always from *player_side*'s perspective.
+    Selection uses GRAVE-UCB (mixing UCB with the AMAF table from the
+    deepest ancestor that has been visited ≥ GRAVE_REF_THRESHOLD times).
+    After each simulation both the standard visit counts and the AMAF
+    tables are updated for every node on the tree path.
+
+    Returns  { move: (total_wins, total_visits) }  for the root's
+    immediate children (always from *player_side*'s perspective).
     """
-    root = MCTSNode(root_board, player_side)
+    root = GRAVENode(root_board, player_side)
 
     for _ in range(num_simulations):
         node = root
+        # path contains every node visited during tree traversal, including root
+        path = [root]
+        ref_node = root             # GRAVE reference: deepest ancestor with enough visits
 
         # ---- Selection ----
         while (node.is_fully_expanded()
                and node.children
                and not node.is_terminal()):
-            node = node.best_child(player_side)
+            # Promote reference node when this node is well-visited
+            if node.visits >= GRAVE_REF_THRESHOLD:
+                ref_node = node
+            node = node.best_child_grave(player_side, ref_node)
+            path.append(node)
 
         # ---- Terminal handling ----
         if node.is_terminal():
@@ -751,60 +812,82 @@ def mcts_in_world(root_board, player_side, num_simulations=50):
                 result = 1.0
             else:
                 result = 0.5
+            sim_moves = []
         else:
             # ---- Expansion ----
             if not node.is_fully_expanded() and node.untried_moves:
                 node = node.expand()
-            # ---- Simulation ----
-            result = mcts_rollout(node.board, node.side, player_side)
+                path.append(node)
 
-        # ---- Backpropagation (iterative) ----
-        n = node
-        while n is not None:
+            # ---- Simulation (random rollout) ----
+            result, sim_moves = grave_rollout(node.board, node.side, player_side)
+
+        # ---- Backpropagation ----
+        # 1. Standard visit/win update for every tree node (via path list)
+        for n in path:
             n.visits += 1
             n.wins += result
-            n = n.parent
 
-    # Collect statistics for root's children
+        # 2. AMAF update: for each node on the tree path, incorporate all
+        #    moves in the rollout that were played by the SAME side as that
+        #    node (RAVE "all moves as first" principle).
+        #    Also include tree-path moves themselves so that even unexplored
+        #    siblings benefit from observed continuations.
+        #
+        #    n.side = side to move AT node n.
+        #    n.move was played TO REACH n, so it was played by n's parent,
+        #    whose side is (1 - n.side) because sides alternate each ply.
+        tree_moves = [(n.move, 1 - n.side)   # (move, side-that-played-it)
+                      for n in path if n.move is not None]
+        all_moves = tree_moves + sim_moves    # tree + simulation moves
+
+        for tree_node in path:
+            for move, side in all_moves:
+                # Update AMAF only for moves played by the same side as
+                # tree_node.side (the side whose turn it is at tree_node).
+                # This records: "if tree_node's side had played *move*
+                # instead, the outcome would have been *result*."
+                if side == tree_node.side:
+                    tree_node.amaf_visits[move] = (
+                        tree_node.amaf_visits.get(move, 0) + 1)
+                    tree_node.amaf_wins[move] = (
+                        tree_node.amaf_wins.get(move, 0.0) + result)
+
     return {move: (child.wins, child.visits)
             for move, child in root.children.items()}
 
 
-def belief_state_mcts(belief_state, observed_board, player_side, time_limit=5.0):
+def belief_state_grave(belief_state, observed_board, player_side, time_limit=5.0):
     """
-    IS-MCTS (Information Set MCTS) over the full belief state.
+    IS-GRAVE (Information-Set MC-GRAVE) over the full belief state.
 
-    For each world in the belief state a separate MCTS tree is grown.
-    Move statistics (wins / visits) are aggregated across all worlds and the
-    move with the highest combined win-rate is returned.
+    Identical in structure to IS-MCTS but uses *grave_in_world* instead of
+    plain UCT MCTS, which provides faster convergence via AMAF statistics.
 
-    This is the core of the Obscuro-style belief-state search described by
-    Sandholm: enumerate consistent worlds, run search in each, pick the move
-    that performs best on average across all consistent positions.
+    For each world in the belief state a separate MC-GRAVE tree is grown.
+    Move statistics are aggregated across all worlds and the move with the
+    highest combined win-rate is returned.
     """
     start_time = time.time()
 
-    # Candidate moves come from the observed (partially foggy) board
     candidate_moves = generate_moves(observed_board, player_side)
     if not candidate_moves:
         return None
 
-    # Use worlds stored in the belief state; fall back to the observed board
     worlds = belief_state.sample() if belief_state.size() > 0 else [observed_board]
     n_worlds = len(worlds)
 
-    # Simulations per world: more worlds → fewer sims each to stay within budget
     sims_per_world = max(BELIEF_MIN_SIMS_PER_WORLD,
                          min(BELIEF_MAX_SIMS_PER_WORLD,
                              BELIEF_TOTAL_SIM_BUDGET // max(1, n_worlds)))
 
-    # Aggregate statistics: move -> [total_wins, total_visits]
     global_stats = {m: [0.0, 0] for m in candidate_moves}
 
     for world in worlds:
         if time.time() - start_time > time_limit:
             break
-        move_stats = mcts_in_world(world, player_side, num_simulations=sims_per_world)
+        move_stats = grave_in_world(world, player_side,
+                                    num_simulations=sims_per_world)
         for move, (wins, visits) in move_stats.items():
             if move in global_stats:
                 global_stats[move][0] += wins
@@ -812,18 +895,18 @@ def belief_state_mcts(belief_state, observed_board, player_side, time_limit=5.0)
             else:
                 global_stats[move] = [wins, visits]
 
-    # Pick the best-evaluated move (highest win-rate among visited moves)
     evaluated = {m: s for m, s in global_stats.items() if s[1] > 0}
     if not evaluated:
-        return candidate_moves[0]  # fallback
+        return candidate_moves[0]   # fallback: return first legal move
 
-    best_move = max(evaluated, key=lambda m: evaluated[m][0] / evaluated[m][1])
+    best_move = max(evaluated,
+                    key=lambda m: evaluated[m][0] / evaluated[m][1])
     best_wins, best_total = global_stats[best_move]
     best_score = best_wins / best_total if best_total > 0 else 0.0
     total_visits = sum(s[1] for s in global_stats.values())
     elapsed = time.time() - start_time
 
-    print(f"# IS-MCTS: {n_worlds} worlds, {total_visits} sims, "
+    print(f"# IS-GRAVE: {n_worlds} worlds, {total_visits} sims, "
           f"{elapsed:.2f}s", flush=True)
     print(f"# Best move {sq_to_alg(best_move[0])}{sq_to_alg(best_move[1])}, "
           f"est win rate {best_score:.2f}", flush=True)
@@ -858,7 +941,7 @@ def draw_board(board):
 
 # Main engine loop (XBoard protocol)
 def main():
-    print("feature ping=1 myname=\"FoWMT v0.1\" done=1", flush=True)
+    print("feature ping=1 myname=\"FoWMT v0.2 (IS-GRAVE)\" done=1", flush=True)
     observed_board = None
     player_side = None
     side_to_move = WHITE  # track which side is to move
@@ -927,7 +1010,7 @@ def main():
                         observed_board, player_side,
                         white_in_hand, black_in_hand, 100)
 
-            best = belief_state_mcts(
+            best = belief_state_grave(
                 belief, observed_board, player_side, time_limit=time_per_move)
             if best:
                 prom_char = ""
