@@ -1,15 +1,16 @@
 ﻿# Simplified Fog-of-War Chess Engine (XBoard protocol)
 # Pure Python, no external libraries (only standard modules: sys, random)
-# Implements a belief-state search (IS-GRAVE) for imperfect information.
-# Algorithm: MC-GRAVE (Monte Carlo with Global AMAF Value Estimation),
-#            which outperforms plain IS-MCTS/UCT on imperfect-information games.
+# Implements a belief-state search (IS-CFR) for imperfect information.
+# Algorithm: External Sampling Monte Carlo CFR (Counterfactual Regret Minimization),
+#            which converges to Nash equilibrium strategies in imperfect-information games.
+# Based on: Lanctot et al. (2009) "Monte Carlo Sampling for Regret Minimization in
+#           Extensive Games", adapted from github.com/tansey/pycfr.
 # Author: Michael Taktikos and Grok (simplified version inspired by Obscuro/Ludii concepts)
 
 
 import sys
 import random
 import time
-import math
 
 
 # Constants
@@ -36,19 +37,19 @@ QUEEN_DELTAS = ROOK_DELTAS + BISHOP_DELTAS
 KING_DELTAS = QUEEN_DELTAS
 
 
-# IS-GRAVE / Belief-state tuning constants
-UCB_EXPLORATION_CONSTANT = 1.41      # standard UCB1 sqrt(2) ≈ 1.41
+# IS-CFR / Belief-state tuning constants
 EVAL_NORMALIZATION_FACTOR = 200.0    # maps centipawn evaluation to [0, 1] range
-BELIEF_MIN_SIMS_PER_WORLD = 10       # floor on GRAVE simulations per determinized world
-BELIEF_MAX_SIMS_PER_WORLD = 300      # cap on GRAVE simulations per determinized world
-BELIEF_TOTAL_SIM_BUDGET = 10000      # total simulation budget distributed across worlds
+BELIEF_MIN_SIMS_PER_WORLD = 10       # floor on CFR iterations per determinized world
+BELIEF_MAX_SIMS_PER_WORLD = 900      # cap on CFR iterations per determinized world
+BELIEF_TOTAL_SIM_BUDGET = 30000      # total simulation budget distributed across worlds
 BELIEF_REFILL_THRESHOLD = 0.5        # re-sample when surviving worlds fall below this fraction
 SAMPLING_ATTEMPT_MULTIPLIER = 15     # max_attempts = desired_worlds * this factor
 
-# MC-GRAVE specific constants
-GRAVE_K = 250           # AMAF beta-mixing parameter: beta = sqrt(k / (3*n + k))
-                        # higher k -> more weight on AMAF early; lower k -> quicker UCB dominance
-GRAVE_REF_THRESHOLD = 50  # minimum visits before a node can serve as the GRAVE reference
+# CFR-specific constants
+CFR_TREE_DEPTH = 2         # levels of full tree expansion in External Sampling CFR:
+                           #   depth 1 = explore all our immediate moves, then sample
+                           #             opponent's reply and roll out from there.
+CFR_ROLLOUT_DEPTH = 30     # random rollout depth at leaf nodes (same as former GRAVE)
 
 
 # Board is 120-element array (0-119), with 0x88 off-board detection
@@ -655,99 +656,11 @@ class BeliefState:
 
 
 # ============================================================
-# MC-GRAVE for FoW Chess  (IS-GRAVE – Information Set MC-GRAVE)
-#
-# MC-GRAVE (Monte Carlo with Global AMAF Value Estimation) improves over
-# plain UCT/MCTS by maintaining AMAF (All Moves As First) statistics at
-# each tree node and using a β-weighted combination of UCB and AMAF when
-# selecting among children.  The "Global" part means the AMAF table of the
-# deepest sufficiently-visited ancestor (the *reference node*) is used for
-# nodes that have been visited fewer than GRAVE_REF_THRESHOLD times, giving
-# those new nodes better initial estimates from the richer ancestor.
+# Random rollout used by CFR for leaf-node evaluation
 # ============================================================
 
 
-class GRAVENode:
-    """
-    MCTS node augmented with AMAF/GRAVE statistics.
-
-    amaf_wins[move]   – cumulative result for this side when *move* was
-                        played anywhere in a rollout that passed through
-                        this node.
-    amaf_visits[move] – how many such rollouts there were.
-    """
-
-    __slots__ = ('board', 'side', 'parent', 'move', 'children',
-                 'visits', 'wins', 'untried_moves',
-                 'amaf_wins', 'amaf_visits')
-
-    def __init__(self, board, side, parent=None, move=None):
-        self.board = board
-        self.side = side          # side to move at this node
-        self.parent = parent
-        self.move = move          # move that led here from parent (None for root)
-        self.children = {}        # move -> GRAVENode
-        self.visits = 0
-        self.wins = 0.0           # wins from root_side's perspective
-        moves = generate_moves(board, side)
-        random.shuffle(moves)
-        self.untried_moves = moves
-        self.amaf_wins = {}       # move -> cumulative AMAF wins
-        self.amaf_visits = {}     # move -> AMAF visit count
-
-    def is_terminal(self):
-        return king_captured(self.board, WHITE) or king_captured(self.board, BLACK)
-
-    def is_fully_expanded(self):
-        return not self.untried_moves
-
-    def grave_ucb(self, child, ref_node, root_side,
-                  exploration=UCB_EXPLORATION_CONSTANT):
-        """
-        GRAVE-UCB score for *child* (reached by *child.move*).
-
-        Uses UCB1 combined with AMAF statistics from *ref_node* (the deepest
-        ancestor that has been visited >= GRAVE_REF_THRESHOLD times).
-        beta = sqrt(k / (3*n_child + k)) controls the AMAF weight; once n_child
-        grows large beta -> 0 and the score reduces to plain UCB.
-        """
-        if child.visits == 0:
-            return float('inf')
-
-        # --- UCB component ---
-        win_rate = child.wins / child.visits
-        if self.side != root_side:          # opponent's turn → flip perspective
-            win_rate = 1.0 - win_rate
-        explore = (exploration
-                   * math.sqrt(math.log(max(1, self.visits)) / child.visits))
-        ucb = win_rate + explore
-
-        # --- AMAF component (from the GRAVE reference node) ---
-        m = child.move
-        amaf_v = ref_node.amaf_visits.get(m, 0)
-        if amaf_v == 0:
-            return ucb                          # no AMAF data yet → plain UCB
-        amaf_rate = ref_node.amaf_wins.get(m, 0.0) / amaf_v
-        if self.side != root_side:
-            amaf_rate = 1.0 - amaf_rate
-
-        beta = math.sqrt(GRAVE_K / (3.0 * child.visits + GRAVE_K))
-        return (1.0 - beta) * ucb + beta * amaf_rate
-
-    def best_child_grave(self, root_side, ref_node,
-                         exploration=UCB_EXPLORATION_CONSTANT):
-        return max(self.children.values(),
-                   key=lambda c: self.grave_ucb(c, ref_node, root_side, exploration))
-
-    def expand(self):
-        move = self.untried_moves.pop()
-        new_board, _ = make_move(self.board, move)
-        child = GRAVENode(new_board, 1 - self.side, parent=self, move=move)
-        self.children[move] = child
-        return child
-
-
-def grave_rollout(board, side, root_side, depth=20):
+def random_rollout(board, side, root_side, depth=20):
     """
     Random playout from *board* with *side* to move.
 
@@ -774,99 +687,198 @@ def grave_rollout(board, side, root_side, depth=20):
     return max(0.0, min(1.0, 0.5 + val / EVAL_NORMALIZATION_FACTOR)), played
 
 
-def grave_in_world(root_board, player_side, num_simulations=50):
+# ============================================================
+# CFR (Counterfactual Regret Minimization) for FoW Chess
+# IS-CFR – Information-Set External Sampling Monte Carlo CFR
+#
+# Based on: Lanctot et al. (2009) "Monte Carlo Sampling for Regret
+#           Minimization in Extensive Games".
+# Reference implementation: github.com/tansey/pycfr (pokercfr.py).
+#
+# Algorithm: External Sampling MCCFR with alternating player updates.
+#   - At the traverser's nodes  → explore ALL legal moves (exact CF values).
+#   - At the opponent's nodes   → sample ONE move from their current strategy.
+#   - At depth limit / terminal → evaluate via a random rollout (grave_rollout).
+#
+# Key data per tree node:
+#   regret_sum[a]   – cumulative counterfactual regret for action a.
+#                     Used by regret matching to derive the current strategy.
+#   strategy_sum[a] – cumulative strategy probabilities.
+#                     The time-average of these converges to Nash equilibrium.
+# ============================================================
+
+
+class CFRNode:
     """
-    Run MC-GRAVE inside one fully-determinized world.
+    Node for External Sampling MCCFR.
 
-    Selection uses GRAVE-UCB (mixing UCB with the AMAF table from the
-    deepest ancestor that has been visited ≥ GRAVE_REF_THRESHOLD times).
-    After each simulation both the standard visit counts and the AMAF
-    tables are updated for every node on the tree path.
-
-    Returns  { move: (total_wins, total_visits) }  for the root's
-    immediate children (always from *player_side*'s perspective).
+    regret_sum[move]   – cumulative counterfactual regrets; drives regret matching.
+    strategy_sum[move] – accumulated strategy probabilities (for the average strategy).
     """
-    root = GRAVENode(root_board, player_side)
 
-    for _ in range(num_simulations):
-        node = root
-        # path contains every node visited during tree traversal, including root
-        path = [root]
-        ref_node = root             # GRAVE reference: deepest ancestor with enough visits
+    __slots__ = ('board', 'side', 'parent', 'move', 'children', 'visits',
+                 'all_moves', 'regret_sum', 'strategy_sum')
 
-        # ---- Selection ----
-        while (node.is_fully_expanded()
-               and node.children
-               and not node.is_terminal()):
-            # Promote reference node when this node is well-visited
-            if node.visits >= GRAVE_REF_THRESHOLD:
-                ref_node = node
-            node = node.best_child_grave(player_side, ref_node)
-            path.append(node)
+    def __init__(self, board, side, parent=None, move=None):
+        self.board = board
+        self.side = side          # side to move at this node
+        self.parent = parent
+        self.move = move          # move that led here from parent
+        self.children = {}        # move -> CFRNode
+        self.visits = 0
+        moves = generate_moves(board, side)
+        random.shuffle(moves)
+        self.all_moves = moves
+        self.regret_sum = {}      # move -> float  (cumulative regret)
+        self.strategy_sum = {}    # move -> float  (for time-average strategy)
 
-        # ---- Terminal handling ----
-        if node.is_terminal():
-            if king_captured(node.board, player_side):
-                result = 0.0
-            elif king_captured(node.board, 1 - player_side):
-                result = 1.0
-            else:
-                result = 0.5
-            sim_moves = []
+    def is_terminal(self):
+        return king_captured(self.board, WHITE) or king_captured(self.board, BLACK)
+
+    def get_strategy(self):
+        """
+        Regret matching: σ(a) = max(R(a), 0) / Σ_a max(R(a), 0).
+        Returns a uniform distribution if no positive regrets exist.
+        """
+        moves = self.all_moves
+        if not moves:
+            return {}
+        pos = {m: max(0.0, self.regret_sum.get(m, 0.0)) for m in moves}
+        total = sum(pos.values())
+        if total > 0:
+            return {m: pos[m] / total for m in moves}
+        return {m: 1.0 / len(moves) for m in moves}
+
+    def get_average_strategy(self):
+        """
+        Time-average strategy: ā(a) = strategy_sum[a] / Σ strategy_sum.
+        This is the strategy that provably converges to Nash equilibrium.
+        """
+        moves = self.all_moves
+        if not moves:
+            return {}
+        total = sum(self.strategy_sum.get(m, 0.0) for m in moves)
+        if total > 0:
+            return {m: self.strategy_sum.get(m, 0.0) / total for m in moves}
+        return {m: 1.0 / len(moves) for m in moves}
+
+
+def _cfr_traverse(node, player_side, traverser, depth):
+    """
+    External Sampling MCCFR traversal for one player (the *traverser*).
+
+    At the traverser's nodes  → explore ALL legal moves, compute exact
+                                counterfactual values, update regrets.
+    At the opponent's nodes   → sample ONE move from their current strategy.
+    At depth 0 / terminal     → evaluate with a random rollout.
+
+    Always returns the game value from *player_side*'s perspective.
+    """
+    # ---- Terminal ----
+    if node.is_terminal():
+        return 1.0 if king_captured(node.board, 1 - player_side) else 0.0
+
+    moves = node.all_moves
+    if not moves:
+        return 0.5  # stalemate
+
+    # ---- Depth limit: random rollout ----
+    if depth == 0:
+        result, _ = random_rollout(node.board, node.side, player_side,
+                                  CFR_ROLLOUT_DEPTH)
+        return result
+
+    strategy = node.get_strategy()
+
+    if node.side == traverser:
+        # ---- Traverser's node: explore ALL moves (exact counterfactual values) ----
+        action_values = {}
+        for move in moves:
+            if move not in node.children:
+                new_board, _ = make_move(node.board, move)
+                child = CFRNode(new_board, 1 - node.side, parent=node, move=move)
+                node.children[move] = child
+            action_values[move] = _cfr_traverse(
+                node.children[move], player_side, traverser, depth - 1)
+
+        # Node value = expectation under current strategy (player_side's perspective)
+        node_value = sum(strategy.get(m, 0.0) * action_values[m] for m in moves)
+
+        # ---- Regret update ----
+        # For player_side: positive regret when an action beats the average.
+        # For opponent   : positive regret when an action lowers player_side's value
+        #                  (i.e., node_value - action_values[m] > 0).
+        if traverser == player_side:
+            for m in moves:
+                node.regret_sum[m] = (node.regret_sum.get(m, 0.0)
+                                      + action_values[m] - node_value)
         else:
-            # ---- Expansion ----
-            if not node.is_fully_expanded() and node.untried_moves:
-                node = node.expand()
-                path.append(node)
+            for m in moves:
+                node.regret_sum[m] = (node.regret_sum.get(m, 0.0)
+                                      + node_value - action_values[m])
 
-            # ---- Simulation (random rollout) ----
-            result, sim_moves = grave_rollout(node.board, node.side, player_side)
+        # ---- Strategy sum update (for time-average strategy) ----
+        for m in moves:
+            node.strategy_sum[m] = (node.strategy_sum.get(m, 0.0)
+                                    + strategy.get(m, 0.0))
 
-        # ---- Backpropagation ----
-        # 1. Standard visit/win update for every tree node (via path list)
-        for n in path:
-            n.visits += 1
-            n.wins += result
+        node.visits += 1
+        return node_value
 
-        # 2. AMAF update: for each node on the tree path, incorporate all
-        #    moves in the rollout that were played by the SAME side as that
-        #    node (RAVE "all moves as first" principle).
-        #    Also include tree-path moves themselves so that even unexplored
-        #    siblings benefit from observed continuations.
-        #
-        #    n.side = side to move AT node n.
-        #    n.move was played TO REACH n, so it was played by n's parent,
-        #    whose side is (1 - n.side) because sides alternate each ply.
-        tree_moves = [(n.move, 1 - n.side)   # (move, side-that-played-it)
-                      for n in path if n.move is not None]
-        all_moves = tree_moves + sim_moves    # tree + simulation moves
+    else:
+        # ---- Opponent's node: sample ONE move from their current strategy ----
+        weights = [strategy.get(m, 0.0) for m in moves]
+        total_w = sum(weights)
+        if total_w == 0:
+            sampled_move = random.choice(moves)
+        else:
+            sampled_move = random.choices(moves, weights=weights, k=1)[0]
 
-        for tree_node in path:
-            for move, side in all_moves:
-                # Update AMAF only for moves played by the same side as
-                # tree_node.side (the side whose turn it is at tree_node).
-                # This records: "if tree_node's side had played *move*
-                # instead, the outcome would have been *result*."
-                if side == tree_node.side:
-                    tree_node.amaf_visits[move] = (
-                        tree_node.amaf_visits.get(move, 0) + 1)
-                    tree_node.amaf_wins[move] = (
-                        tree_node.amaf_wins.get(move, 0.0) + result)
+        if sampled_move not in node.children:
+            new_board, _ = make_move(node.board, sampled_move)
+            child = CFRNode(new_board, 1 - node.side, parent=node, move=sampled_move)
+            node.children[sampled_move] = child
 
-    return {move: (child.wins, child.visits)
-            for move, child in root.children.items()}
+        child_value = _cfr_traverse(
+            node.children[sampled_move], player_side, traverser, depth - 1)
+
+        node.visits += 1
+        return child_value
 
 
-def belief_state_grave(belief_state, observed_board, player_side, time_limit=5.0):
+def cfr_in_world(root_board, player_side, num_iterations=10):
     """
-    IS-GRAVE (Information-Set MC-GRAVE) over the full belief state.
+    External Sampling MCCFR with alternating updates in one determinized world.
 
-    Identical in structure to IS-MCTS but uses *grave_in_world* instead of
-    plain UCT MCTS, which provides faster convergence via AMAF statistics.
+    Alternating updates (even t → player_side is the traverser, odd t → opponent)
+    have lower variance and faster practical convergence than updating a single
+    player every iteration.
 
-    For each world in the belief state a separate MC-GRAVE tree is grown.
-    Move statistics are aggregated across all worlds and the move with the
-    highest combined win-rate is returned.
+    Returns {move: probability} – the time-average strategy at the root for
+    player_side's moves.  This average strategy converges to Nash equilibrium.
+    """
+    root = CFRNode(root_board, player_side)
+    opp_side = 1 - player_side
+
+    for t in range(num_iterations):
+        traverser = player_side if (t % 2 == 0) else opp_side
+        _cfr_traverse(root, player_side, traverser, CFR_TREE_DEPTH)
+
+    return root.get_average_strategy()
+
+
+def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
+    """
+    IS-CFR (Information-Set CFR) over the full belief state.
+
+    For each world sampled from the belief state, runs External Sampling MCCFR
+    to compute the time-average strategy.  Move probabilities are aggregated
+    across all worlds and the move with the highest combined probability is
+    returned.
+
+    Key difference from IS-GRAVE: instead of UCB-based (AMAF) selection, CFR
+    uses *regret matching*, which provides convergence-to-Nash guarantees and
+    typically yields stronger strategic decisions in imperfect-information games.
     """
     start_time = time.time()
 
@@ -877,39 +889,44 @@ def belief_state_grave(belief_state, observed_board, player_side, time_limit=5.0
     worlds = belief_state.sample() if belief_state.size() > 0 else [observed_board]
     n_worlds = len(worlds)
 
-    sims_per_world = max(BELIEF_MIN_SIMS_PER_WORLD,
-                         min(BELIEF_MAX_SIMS_PER_WORLD,
-                             BELIEF_TOTAL_SIM_BUDGET // max(1, n_worlds)))
+    # Each CFR iteration at depth=1 explores ~len(moves) children at the root,
+    # so the effective simulation count per iteration scales with the branching
+    # factor.  We scale down iterations_per_world accordingly to keep total
+    # rollout count comparable to the former IS-GRAVE budget.
+    estimated_branching_factor = max(1, len(candidate_moves))
+    raw_sims = max(BELIEF_MIN_SIMS_PER_WORLD,
+                   min(BELIEF_MAX_SIMS_PER_WORLD,
+                       BELIEF_TOTAL_SIM_BUDGET // max(1, n_worlds)))
+    # Minimum of 2 so that both players get at least one alternating update
+    # each (even iteration → player_side traverses, odd → opponent traverses).
+    iterations_per_world = max(2, raw_sims // estimated_branching_factor)
 
-    global_stats = {m: [0.0, 0] for m in candidate_moves}
+    global_strategy = {m: 0.0 for m in candidate_moves}
+    worlds_processed = 0
 
     for world in worlds:
         if time.time() - start_time > time_limit:
             break
-        move_stats = grave_in_world(world, player_side,
-                                    num_simulations=sims_per_world)
-        for move, (wins, visits) in move_stats.items():
-            if move in global_stats:
-                global_stats[move][0] += wins
-                global_stats[move][1] += visits
-            else:
-                global_stats[move] = [wins, visits]
+        avg_strategy = cfr_in_world(world, player_side,
+                                    num_iterations=iterations_per_world)
+        for move, prob in avg_strategy.items():
+            if move in global_strategy:
+                global_strategy[move] += prob
+        worlds_processed += 1
 
-    evaluated = {m: s for m, s in global_stats.items() if s[1] > 0}
-    if not evaluated:
-        return candidate_moves[0]   # fallback: return first legal move
+    total_weight = sum(global_strategy.values())
+    if total_weight == 0:
+        return candidate_moves[0]
 
-    best_move = max(evaluated,
-                    key=lambda m: evaluated[m][0] / evaluated[m][1])
-    best_wins, best_total = global_stats[best_move]
-    best_score = best_wins / best_total if best_total > 0 else 0.0
-    total_visits = sum(s[1] for s in global_stats.values())
+    best_move = max(global_strategy, key=global_strategy.get)
+    best_score = global_strategy[best_move] / max(1, worlds_processed)
     elapsed = time.time() - start_time
+    total_iters = worlds_processed * iterations_per_world
 
-    print(f"# IS-GRAVE: {n_worlds} worlds, {total_visits} sims, "
+    print(f"# IS-CFR: {worlds_processed} worlds, {total_iters} iterations, "
           f"{elapsed:.2f}s", flush=True)
     print(f"# Best move {sq_to_alg(best_move[0])}{sq_to_alg(best_move[1])}, "
-          f"est win rate {best_score:.2f}", flush=True)
+          f"est strategy prob {best_score:.3f}", flush=True)
 
     return best_move
 
@@ -941,12 +958,12 @@ def draw_board(board):
 
 # Main engine loop (XBoard protocol)
 def main():
-    print("feature ping=1 myname=\"FoWMT v0.2 (IS-GRAVE)\" done=1", flush=True)
+    print("feature ping=1 myname=\"FoWMT v0.3 (IS-CFR)\" done=1", flush=True)
     observed_board = None
     player_side = None
     side_to_move = WHITE  # track which side is to move
     force_mode = False
-    time_per_move = 15.0  # default time per move in seconds
+    time_per_move = 40.0  # default time per move in seconds
     white_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
     black_in_hand = {PAWN: 0, KNIGHT: 0, BISHOP: 0, ROOK: 0, QUEEN: 0, KING: 0}
 
@@ -1010,7 +1027,7 @@ def main():
                         observed_board, player_side,
                         white_in_hand, black_in_hand, 100)
 
-            best = belief_state_grave(
+            best = belief_state_cfr(
                 belief, observed_board, player_side, time_limit=time_per_move)
             if best:
                 prom_char = ""
