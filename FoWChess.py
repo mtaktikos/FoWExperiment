@@ -15,6 +15,7 @@
 import sys
 import random
 import time
+import math
 
 
 # Constants
@@ -54,6 +55,9 @@ CFR_TREE_DEPTH = 2         # levels of full tree expansion in External Sampling 
                            #   depth 1 = explore all our immediate moves, then sample
                            #             opponent's reply and roll out from there.
 CFR_ROLLOUT_DEPTH = 30     # random rollout depth at leaf nodes (same as former GRAVE)
+
+# GT-CFR / PUCT constants
+PUCT_C = 1.5               # exploration constant for PUCT selection at opponent nodes
 
 
 # Board is 120-element array (0-119), with 0x88 off-board detection
@@ -723,15 +727,21 @@ def random_rollout(board, side, root_side, depth=20):
 
 class CFRNode:
     """
-    Node for External Sampling MCCFR with PCFR+ updates.
+    Node for one-sided GT-CFR with PUCT+variance updates.
 
     regret_sum[move]            – cumulative non-negative regrets (RM+ clamped).
     last_immediate_regret[move] – immediate regret from the most recent traversal
                                   iteration; used as the prediction in PCFR+.
+    value_sum                   – sum of all sampled values at this node.
+    value_sq_sum                – sum of squared values (for variance estimation).
+    child_visits[move]          – visit count per action (used by PUCT).
+    init_value                  – initial Q-value used before a child is visited
+                                  (set to best sibling's mean value, or static eval).
     """
 
     __slots__ = ('board', 'side', 'parent', 'move', 'children', 'visits',
-                 'all_moves', 'regret_sum', 'last_immediate_regret')
+                 'all_moves', 'regret_sum', 'last_immediate_regret',
+                 'value_sum', 'value_sq_sum', 'child_visits', 'init_value')
 
     def __init__(self, board, side, parent=None, move=None):
         self.board = board
@@ -745,6 +755,10 @@ class CFRNode:
         self.all_moves = moves
         self.regret_sum = {m: 0.0 for m in moves}           # cumulative R+, always ≥ 0
         self.last_immediate_regret = {m: 0.0 for m in moves} # immediate regret, prediction
+        self.value_sum = 0.0      # accumulated value samples
+        self.value_sq_sum = 0.0   # accumulated squared value samples (variance)
+        self.child_visits = {m: 0 for m in moves}            # PUCT visit counts per action
+        self.init_value = 0.5     # prior Q-value for unvisited actions (set during node creation from best sibling or static eval)
 
     def is_terminal(self):
         return king_captured(self.board, WHITE) or king_captured(self.board, BLACK)
@@ -768,97 +782,199 @@ class CFRNode:
         return {m: 1.0 / len(moves) for m in moves}
 
 
-def _cfr_traverse(node, player_side, traverser, depth):
+def _best_child_value(node, player_side):
     """
-    External Sampling MCCFR traversal with PCFR+ updates for one player (the *traverser*).
+    Return the best mean value among already-visited children of *node*,
+    from *player_side*'s perspective.  Used to initialise new child nodes
+    so that fresh expansions start with an informed Q-estimate rather than
+    the neutral 0.5 prior.
 
-    At the traverser's nodes  → explore ALL legal moves, compute exact
-                                counterfactual values, update regrets (PCFR+).
-    At the opponent's nodes   → sample ONE move from their current strategy.
-    At depth 0 / terminal     → evaluate with a random rollout.
+    Falls back to a material-based static evaluation when no sibling has
+    been visited yet.
+    """
+    best = None
+    for child in node.children.values():
+        if child.visits > 0:
+            v = child.value_sum / child.visits
+            if best is None or v > best:
+                best = v
+    if best is not None:
+        return best
+    # No visited children yet – use a normalised material estimate
+    val = evaluate(node.board, player_side)
+    return max(0.0, min(1.0, 0.5 + val / EVAL_NORMALIZATION_FACTOR))
+
+
+def _puct_select(node, player_side):
+    """
+    PUCT selection with variance bonus for opponent nodes (one-sided GT-CFR).
+
+    Score for action *a*:
+        PUCT(a) = Q(a) + c * P(a) * sqrt(N) / (1 + n(a)) + sqrt(Var(a) / max(1, n(a)))
+
+    Where:
+        Q(a)   – mean return from child (or node.init_value for unvisited)
+        P(a)   – prior from the current CFR strategy
+        N      – total parent visits + 1
+        n(a)   – visit count for action a (node.child_visits[a])
+        Var(a) – empirical return variance from child (0 for unvisited)
+        c      – PUCT_C exploration constant
+
+    Returns the selected move (falls back to a random choice when all_moves
+    is empty, which should not happen in normal play).
+    """
+    strategy = node.get_strategy()
+    total_visits = node.visits + 1
+
+    best_move = None
+    best_score = -float('inf')
+
+    for move in node.all_moves:
+        n_child = node.child_visits.get(move, 0)
+        child = node.children.get(move)
+
+        if child is None or n_child == 0:
+            q = node.init_value
+            var_bonus = 0.0
+        else:
+            # n_child > 0 implies child.visits > 0 (both counters are incremented together)
+            q = child.value_sum / child.visits
+            if child.visits > 1:
+                mean_sq = child.value_sq_sum / child.visits
+                variance = max(0.0, mean_sq - q * q)
+                var_bonus = math.sqrt(variance / child.visits)
+            else:
+                var_bonus = 0.0
+
+        p = strategy.get(move, 1.0 / max(1, len(node.all_moves)))
+        exploration = PUCT_C * p * math.sqrt(total_visits) / (1 + n_child)
+        score = q + exploration + var_bonus
+
+        if score > best_score:
+            best_score = score
+            best_move = move
+
+    if best_move is None:
+        # all_moves is empty – should not occur in normal play
+        raise RuntimeError("_puct_select called on a node with no legal moves")
+    return best_move
+
+
+def _gt_cfr_traverse(node, player_side, traverser, depth):
+    """
+    One-sided GT-CFR traversal with PCFR+ updates for one player (the *traverser*).
+
+    Traverser's nodes  → expand ALL legal moves (one-sided GT-CFR), compute
+                         exact counterfactual values, apply PCFR+ regret update.
+    Opponent's nodes   → select ONE move via PUCT with variance bonus.
+    Depth 0 / terminal → evaluate with a random rollout.
+
+    Each visited node accumulates value_sum and value_sq_sum so that PUCT at
+    ancestor nodes can use empirical variance in the exploration bonus.
+    New child nodes are initialised to the best known sibling's Q-value
+    rather than the neutral 0.5 prior.
 
     Always returns the game value from *player_side*'s perspective.
     """
     # ---- Terminal ----
     if node.is_terminal():
-        return 1.0 if king_captured(node.board, 1 - player_side) else 0.0
+        result = 1.0 if king_captured(node.board, 1 - player_side) else 0.0
+        node.value_sum += result
+        node.value_sq_sum += result * result
+        node.visits += 1
+        return result
 
     moves = node.all_moves
     if not moves:
-        return 0.5  # stalemate
+        stalemate_value = 0.5
+        node.value_sum += stalemate_value
+        node.value_sq_sum += stalemate_value * stalemate_value
+        node.visits += 1
+        return stalemate_value  # stalemate
 
     # ---- Depth limit: random rollout ----
     if depth == 0:
         result, _ = random_rollout(node.board, node.side, player_side,
                                    CFR_ROLLOUT_DEPTH)
+        node.value_sum += result
+        node.value_sq_sum += result * result
+        node.visits += 1
         return result
 
     strategy = node.get_strategy()
 
     if node.side == traverser:
-        # ---- Traverser's node: explore ALL moves (exact counterfactual values) ----
+        # ---- Traverser's node: expand ALL moves (one-sided GT-CFR) ----
         action_values = {}
         for move in moves:
             if move not in node.children:
                 new_board, _ = make_move(node.board, move)
                 child = CFRNode(new_board, 1 - node.side, parent=node, move=move)
+                # Initialise to best known sibling value (GT-CFR best-child init)
+                child.init_value = _best_child_value(node, player_side)
                 node.children[move] = child
-            action_values[move] = _cfr_traverse(
+            node.child_visits[move] = node.child_visits.get(move, 0) + 1
+            action_values[move] = _gt_cfr_traverse(
                 node.children[move], player_side, traverser, depth - 1)
 
         # Node value = expectation under current strategy (player_side's perspective)
         node_value = sum(strategy.get(m, 0.0) * action_values[m] for m in moves)
 
         # ---- PCFR+ regret update ----
-        # Compute immediate (per-iteration) counterfactual regret, store as the
-        # prediction for the NEXT iteration, then apply RM+ clamping (R+ ≥ 0).
         sign = 1.0 if traverser == player_side else -1.0
         for m in moves:
             imm = sign * (action_values[m] - node_value)
             node.last_immediate_regret[m] = imm
             node.regret_sum[m] = max(0.0, node.regret_sum.get(m, 0.0) + imm)
 
-        node.visits += 1
-        return node_value
-
     else:
-        # ---- Opponent's node: sample ONE move from their current strategy ----
-        weights = [strategy.get(m, 0.0) for m in moves]
-        total_w = sum(weights)
-        if total_w == 0:
-            sampled_move = random.choice(moves)
-        else:
-            sampled_move = random.choices(moves, weights=weights, k=1)[0]
+        # ---- Opponent's node: PUCT selection with variance bonus ----
+        selected_move = _puct_select(node, player_side)
 
-        if sampled_move not in node.children:
-            new_board, _ = make_move(node.board, sampled_move)
-            child = CFRNode(new_board, 1 - node.side, parent=node, move=sampled_move)
-            node.children[sampled_move] = child
+        if selected_move not in node.children:
+            new_board, _ = make_move(node.board, selected_move)
+            child = CFRNode(new_board, 1 - node.side, parent=node, move=selected_move)
+            # Initialise to best known sibling value (GT-CFR best-child init)
+            child.init_value = _best_child_value(node, player_side)
+            node.children[selected_move] = child
 
-        child_value = _cfr_traverse(
-            node.children[sampled_move], player_side, traverser, depth - 1)
+        node.child_visits[selected_move] = node.child_visits.get(selected_move, 0) + 1
+        node_value = _gt_cfr_traverse(
+            node.children[selected_move], player_side, traverser, depth - 1)
 
-        node.visits += 1
-        return child_value
+    node.value_sum += node_value
+    node.value_sq_sum += node_value * node_value
+    node.visits += 1
+    return node_value
 
 
 def cfr_in_world(root_board, player_side, num_iterations=10):
     """
-    External Sampling MCCFR with PCFR+ updates in one determinized world.
+    One-sided GT-CFR with PCFR+ updates in one determinized world.
 
-    Alternating updates (even t → player_side is the traverser, odd t → opponent)
-    reduce variance and accelerate practical convergence.
+    Each iteration alternates the exploring side (traverser):
+        even t → player_side traverses (explores all their moves)
+        odd  t → opponent traverses     (explores all opponent's moves)
+    This alternating exploring side reduces variance and accelerates convergence.
+
+    The root node's init_value is seeded from a static material evaluation so
+    that PUCT at child nodes has an informed prior from the very first iteration.
 
     Returns {move: probability} – the *last-iterate* strategy at the root for
     player_side's moves.  PCFR+ last iterates converge to Nash equilibrium
     (no time-averaging required).
     """
     root = CFRNode(root_board, player_side)
+    # Seed root init_value from static evaluation (best-child init for the root)
+    val = evaluate(root_board, player_side)
+    root.init_value = max(0.0, min(1.0, 0.5 + val / EVAL_NORMALIZATION_FACTOR))
+
     opp_side = 1 - player_side
 
     for t in range(num_iterations):
+        # Alternating exploring side: even → player_side, odd → opponent
         traverser = player_side if (t % 2 == 0) else opp_side
-        _cfr_traverse(root, player_side, traverser, CFR_TREE_DEPTH)
+        _gt_cfr_traverse(root, player_side, traverser, CFR_TREE_DEPTH)
 
     # Last iterate: return the current strategy (not the time-average)
     return root.get_strategy()
@@ -866,17 +982,25 @@ def cfr_in_world(root_board, player_side, num_iterations=10):
 
 def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
     """
-    IS-PCFR+ (Information-Set Predictive CFR+) over the full belief state.
+    IS-PCFR+ over the full belief state, using one-sided GT-CFR expansion.
 
-    For each world sampled from the belief state, runs External Sampling MCCFR
-    with PCFR+ updates (PRM+ clamping + predictive strategy) to compute the
+    For each world sampled from the belief state, runs one-sided GT-CFR with
+    PCFR+ updates (PRM+ clamping + predictive strategy) to compute the
     last-iterate strategy.  Move probabilities are aggregated across all worlds
     and the move with the highest combined probability is returned.
 
-    Key differences from IS-CFR:
+    Key algorithmic features:
+      - One-sided GT-CFR expansion: only the current traverser's subtree is
+        fully expanded each iteration; the opponent side uses PUCT selection.
+      - PUCT with variance: opponent move selection uses Q + c*P*sqrt(N)/(1+n)
+        plus a variance bonus sqrt(Var/n), balancing exploration and exploitation.
+      - Alternating exploring side: even iterations expand player_side's moves,
+        odd iterations expand the opponent's, reducing update variance.
+      - Best-child initialisation: new child nodes start with the best mean
+        value seen among their siblings (or static eval), not a flat 0.5 prior.
       - PRM+: cumulative regrets are clamped to ≥ 0 (no negative accumulation).
-      - Predictive strategy: each iteration's strategy is informed by the
-        immediate regret from the previous iteration (faster convergence).
+      - Predictive strategy: each iteration's strategy uses the immediate regret
+        from the previous iteration as a prediction (faster convergence).
       - Last-iterate play: the current strategy is used directly, with no
         time-averaging, giving stronger practical performance.
     """
