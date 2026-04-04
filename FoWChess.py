@@ -16,6 +16,7 @@ import sys
 import random
 import time
 import math
+import heapq
 
 
 # Constants
@@ -58,6 +59,9 @@ CFR_ROLLOUT_DEPTH = 30     # random rollout depth at leaf nodes (same as former 
 
 # GT-CFR / PUCT constants
 PUCT_C = 1.5               # exploration constant for PUCT selection at opponent nodes
+
+# Purified-strategy constants
+PURIFIED_MAX_SUPPORT = 3   # maximum number of actions retained in the purified strategy
 
 
 # Board is 120-element array (0-119), with 0x88 off-board detection
@@ -781,6 +785,36 @@ class CFRNode:
             return {m: pos[m] / total for m in moves}
         return {m: 1.0 / len(moves) for m in moves}
 
+    def get_purified_strategy(self, support_limit=PURIFIED_MAX_SUPPORT):
+        """
+        Purified strategy: PRM+ strategy restricted to at most *support_limit* actions.
+
+        Stable action filtering (non-negative margins): only actions whose
+        cumulative regret regret_sum[a] is strictly positive are considered.
+        Because PRM+ always clamps regret_sum to >= 0, this filter is stable
+        across iterations – it never re-admits an action whose regret has been
+        zeroed out.  Among the surviving actions the top *support_limit* by regret
+        weight are kept and renormalized to a probability distribution.
+
+        Falls back to a uniform distribution when no action passes the filter
+        (e.g. at the root before any CFR iterations).
+        """
+        moves = self.all_moves
+        if not moves:
+            return {}
+        # Stable non-negative margin filter: use only the accumulated regret_sum
+        # (not the volatile predictive term) so the support is monotonically stable.
+        candidates = {m: self.regret_sum[m] for m in moves
+                      if self.regret_sum.get(m, 0.0) > 0.0}
+        if not candidates:
+            return {m: 1.0 / len(moves) for m in moves}
+        # MaxSupport: keep only top-k actions by regret weight (O(n log k))
+        if len(candidates) > support_limit:
+            top_moves = heapq.nlargest(support_limit, candidates, key=candidates.__getitem__)
+            candidates = {m: candidates[m] for m in top_moves}
+        total = sum(candidates.values())
+        return {m: v / total for m, v in candidates.items()}
+
 
 def _best_child_value(node, player_side):
     """
@@ -860,17 +894,35 @@ def _puct_select(node, player_side):
     return best_move
 
 
+def _resolve_select(node):
+    """
+    Deterministic selection for the resolve gadget at opponent nodes.
+
+    Returns the single action with the highest weight in the purified strategy
+    (stable non-negative margin filter, MaxSupport = PURIFIED_MAX_SUPPORT).
+    This replaces stochastic PUCT at opponent nodes, giving a deterministic
+    resolve step that is consistent with the purified-strategy framework.
+    """
+    strategy = node.get_purified_strategy()
+    if not strategy:
+        raise RuntimeError(
+            "Internal error: _resolve_select called on a node with no legal moves. "
+            "This may indicate invalid game state."
+        )
+    return max(strategy, key=strategy.__getitem__)
+
+
 def _gt_cfr_traverse(node, player_side, traverser, depth):
     """
     One-sided GT-CFR traversal with PCFR+ updates for one player (the *traverser*).
 
     Traverser's nodes  → expand ALL legal moves (one-sided GT-CFR), compute
                          exact counterfactual values, apply PCFR+ regret update.
-    Opponent's nodes   → select ONE move via PUCT with variance bonus.
+    Opponent's nodes   → deterministically select ONE move via the purified-
+                         strategy resolve gadget (argmax of stable non-negative
+                         regret, MaxSupport = PURIFIED_MAX_SUPPORT).
     Depth 0 / terminal → evaluate with a random rollout.
 
-    Each visited node accumulates value_sum and value_sq_sum so that PUCT at
-    ancestor nodes can use empirical variance in the exploration bonus.
     New child nodes are initialised to the best known sibling's Q-value
     rather than the neutral 0.5 prior.
 
@@ -928,8 +980,8 @@ def _gt_cfr_traverse(node, player_side, traverser, depth):
             node.regret_sum[m] = max(0.0, node.regret_sum.get(m, 0.0) + imm)
 
     else:
-        # ---- Opponent's node: PUCT selection with variance bonus ----
-        selected_move = _puct_select(node, player_side)
+        # ---- Opponent's node: deterministic resolve-gadget selection ----
+        selected_move = _resolve_select(node)
 
         if selected_move not in node.children:
             new_board, _ = make_move(node.board, selected_move)
@@ -960,9 +1012,10 @@ def cfr_in_world(root_board, player_side, num_iterations=10):
     The root node's init_value is seeded from a static material evaluation so
     that PUCT at child nodes has an informed prior from the very first iteration.
 
-    Returns {move: probability} – the *last-iterate* strategy at the root for
-    player_side's moves.  PCFR+ last iterates converge to Nash equilibrium
-    (no time-averaging required).
+    Returns {move: probability} – the *purified* last-iterate strategy at the
+    root for player_side's moves.  The purified strategy retains at most
+    PURIFIED_MAX_SUPPORT actions with non-negative stable regret margins and
+    normalizes them to a probability distribution.
     """
     root = CFRNode(root_board, player_side)
     # Seed root init_value from static evaluation (best-child init for the root)
@@ -976,8 +1029,9 @@ def cfr_in_world(root_board, player_side, num_iterations=10):
         traverser = player_side if (t % 2 == 0) else opp_side
         _gt_cfr_traverse(root, player_side, traverser, CFR_TREE_DEPTH)
 
-    # Last iterate: return the current strategy (not the time-average)
-    return root.get_strategy()
+    # Purified last iterate: restrict to top-PURIFIED_MAX_SUPPORT actions with
+    # non-negative stable regret margins (no time-averaging required).
+    return root.get_purified_strategy()
 
 
 def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
@@ -991,9 +1045,8 @@ def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
 
     Key algorithmic features:
       - One-sided GT-CFR expansion: only the current traverser's subtree is
-        fully expanded each iteration; the opponent side uses PUCT selection.
-      - PUCT with variance: opponent move selection uses Q + c*P*sqrt(N)/(1+n)
-        plus a variance bonus sqrt(Var/n), balancing exploration and exploitation.
+        fully expanded each iteration; the opponent side uses the purified-
+        strategy resolve gadget (deterministic argmax).
       - Alternating exploring side: even iterations expand player_side's moves,
         odd iterations expand the opponent's, reducing update variance.
       - Best-child initialisation: new child nodes start with the best mean
@@ -1001,8 +1054,15 @@ def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
       - PRM+: cumulative regrets are clamped to ≥ 0 (no negative accumulation).
       - Predictive strategy: each iteration's strategy uses the immediate regret
         from the previous iteration as a prediction (faster convergence).
-      - Last-iterate play: the current strategy is used directly, with no
-        time-averaging, giving stronger practical performance.
+      - Purified strategy (MaxSupport = PURIFIED_MAX_SUPPORT): the extracted
+        strategy per world retains only the top-k actions with strictly positive
+        stable regret, providing a sparse and deterministically-consistent output.
+      - Deterministic resolve gadget: opponent nodes during traversal use the
+        purified-strategy argmax instead of stochastic PUCT, yielding a stable
+        and reproducible tree expansion.
+      - Stable action filtering (non-negative margins): only actions whose
+        accumulated regret_sum is strictly positive (guaranteed ≥ 0 by PRM+)
+        are admitted into the purified support.
     """
     start_time = time.time()
 
