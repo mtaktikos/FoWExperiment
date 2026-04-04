@@ -1,9 +1,13 @@
 ﻿# Simplified Fog-of-War Chess Engine (XBoard protocol)
 # Pure Python, no external libraries (only standard modules: sys, random)
-# Implements a belief-state search (IS-CFR) for imperfect information.
-# Algorithm: External Sampling Monte Carlo CFR (Counterfactual Regret Minimization),
-#            which converges to Nash equilibrium strategies in imperfect-information games.
-# Based on: Lanctot et al. (2009) "Monte Carlo Sampling for Regret Minimization in
+# Implements a belief-state search (IS-PCFR+) for imperfect information.
+# Algorithm: Predictive CFR+ (PCFR+) with Positive Regret Matching+ (PRM+) and
+#            last-iterate play (no strategic averaging at runtime).
+#            Converges to Nash equilibrium strategies in imperfect-information games
+#            with faster last-iterate convergence than vanilla CFR.
+# Based on: Farina, Kroer, Sandholm (2021) "Faster Game Solving via Predictive
+#           Blackwell Approachability: Connecting Regret Matching and Mirror Descent";
+#           Lanctot et al. (2009) "Monte Carlo Sampling for Regret Minimization in
 #           Extensive Games", adapted from github.com/tansey/pycfr.
 # Author: Michael Taktikos and Grok (simplified version inspired by Obscuro/Ludii concepts)
 
@@ -45,7 +49,7 @@ BELIEF_TOTAL_SIM_BUDGET = 30000      # total simulation budget distributed acros
 BELIEF_REFILL_THRESHOLD = 0.5        # re-sample when surviving worlds fall below this fraction
 SAMPLING_ATTEMPT_MULTIPLIER = 15     # max_attempts = desired_worlds * this factor
 
-# CFR-specific constants
+# PCFR+-specific constants
 CFR_TREE_DEPTH = 2         # levels of full tree expansion in External Sampling CFR:
                            #   depth 1 = explore all our immediate moves, then sample
                            #             opponent's reply and roll out from there.
@@ -688,36 +692,46 @@ def random_rollout(board, side, root_side, depth=20):
 
 
 # ============================================================
-# CFR (Counterfactual Regret Minimization) for FoW Chess
-# IS-CFR – Information-Set External Sampling Monte Carlo CFR
+# PCFR+ (Predictive CFR+) for FoW Chess
+# IS-PCFR+ – Information-Set External Sampling Monte Carlo PCFR+
 #
-# Based on: Lanctot et al. (2009) "Monte Carlo Sampling for Regret
-#           Minimization in Extensive Games".
-# Reference implementation: github.com/tansey/pycfr (pokercfr.py).
+# Based on: Farina, Kroer, Sandholm (2021) "Faster Game Solving via Predictive
+#           Blackwell Approachability: Connecting Regret Matching and Mirror
+#           Descent"; Lanctot et al. (2009) MCCFR.
+#
+# Key improvements over vanilla CFR:
+#   1. PRM+ (Positive Regret Matching+): cumulative regrets are clamped to ≥ 0
+#      after each update, eliminating harmful negative regret accumulation.
+#   2. Predictive strategy: the strategy at iteration t uses
+#        σ(t)[a] = RM+(R+(t-1)[a] + r(t-1)[a])
+#      where r(t-1) is the *immediate* counterfactual regret from the previous
+#      iteration (the "prediction").  This accelerates convergence.
+#   3. Last-iterate play: at runtime we play the *current* strategy σ(t),
+#      not the time-average.  PCFR+ last iterates converge to Nash equilibrium.
 #
 # Algorithm: External Sampling MCCFR with alternating player updates.
 #   - At the traverser's nodes  → explore ALL legal moves (exact CF values).
 #   - At the opponent's nodes   → sample ONE move from their current strategy.
-#   - At depth limit / terminal → evaluate via a random rollout (grave_rollout).
+#   - At depth limit / terminal → evaluate via a random rollout.
 #
 # Key data per tree node:
-#   regret_sum[a]   – cumulative counterfactual regret for action a.
-#                     Used by regret matching to derive the current strategy.
-#   strategy_sum[a] – cumulative strategy probabilities.
-#                     The time-average of these converges to Nash equilibrium.
+#   regret_sum[a]           – cumulative non-negative counterfactual regret (R+).
+#   last_immediate_regret[a]– immediate regret r(t-1) used as prediction for
+#                             the next iteration's strategy.
 # ============================================================
 
 
 class CFRNode:
     """
-    Node for External Sampling MCCFR.
+    Node for External Sampling MCCFR with PCFR+ updates.
 
-    regret_sum[move]   – cumulative counterfactual regrets; drives regret matching.
-    strategy_sum[move] – accumulated strategy probabilities (for the average strategy).
+    regret_sum[move]            – cumulative non-negative regrets (RM+ clamped).
+    last_immediate_regret[move] – immediate regret from the most recent traversal
+                                  iteration; used as the prediction in PCFR+.
     """
 
     __slots__ = ('board', 'side', 'parent', 'move', 'children', 'visits',
-                 'all_moves', 'regret_sum', 'strategy_sum')
+                 'all_moves', 'regret_sum', 'last_immediate_regret')
 
     def __init__(self, board, side, parent=None, move=None):
         self.board = board
@@ -729,46 +743,37 @@ class CFRNode:
         moves = generate_moves(board, side)
         random.shuffle(moves)
         self.all_moves = moves
-        self.regret_sum = {}      # move -> float  (cumulative regret)
-        self.strategy_sum = {}    # move -> float  (for time-average strategy)
+        self.regret_sum = {m: 0.0 for m in moves}           # cumulative R+, always ≥ 0
+        self.last_immediate_regret = {m: 0.0 for m in moves} # immediate regret, prediction
 
     def is_terminal(self):
         return king_captured(self.board, WHITE) or king_captured(self.board, BLACK)
 
     def get_strategy(self):
         """
-        Regret matching: σ(a) = max(R(a), 0) / Σ_a max(R(a), 0).
-        Returns a uniform distribution if no positive regrets exist.
+        Predictive RM+: σ(a) = max(R+(a) + r_pred(a), 0) / Σ max(R+(a) + r_pred(a), 0).
+
+        The prediction r_pred is the immediate regret from the previous iteration.
+        Falls back to a uniform distribution when no positive predictive regret exists.
         """
         moves = self.all_moves
         if not moves:
             return {}
-        pos = {m: max(0.0, self.regret_sum.get(m, 0.0)) for m in moves}
+        pos = {m: max(0.0, self.regret_sum.get(m, 0.0)
+                      + self.last_immediate_regret.get(m, 0.0))
+               for m in moves}
         total = sum(pos.values())
         if total > 0:
             return {m: pos[m] / total for m in moves}
         return {m: 1.0 / len(moves) for m in moves}
 
-    def get_average_strategy(self):
-        """
-        Time-average strategy: ā(a) = strategy_sum[a] / Σ strategy_sum.
-        This is the strategy that provably converges to Nash equilibrium.
-        """
-        moves = self.all_moves
-        if not moves:
-            return {}
-        total = sum(self.strategy_sum.get(m, 0.0) for m in moves)
-        if total > 0:
-            return {m: self.strategy_sum.get(m, 0.0) / total for m in moves}
-        return {m: 1.0 / len(moves) for m in moves}
-
 
 def _cfr_traverse(node, player_side, traverser, depth):
     """
-    External Sampling MCCFR traversal for one player (the *traverser*).
+    External Sampling MCCFR traversal with PCFR+ updates for one player (the *traverser*).
 
     At the traverser's nodes  → explore ALL legal moves, compute exact
-                                counterfactual values, update regrets.
+                                counterfactual values, update regrets (PCFR+).
     At the opponent's nodes   → sample ONE move from their current strategy.
     At depth 0 / terminal     → evaluate with a random rollout.
 
@@ -785,7 +790,7 @@ def _cfr_traverse(node, player_side, traverser, depth):
     # ---- Depth limit: random rollout ----
     if depth == 0:
         result, _ = random_rollout(node.board, node.side, player_side,
-                                  CFR_ROLLOUT_DEPTH)
+                                   CFR_ROLLOUT_DEPTH)
         return result
 
     strategy = node.get_strategy()
@@ -804,23 +809,14 @@ def _cfr_traverse(node, player_side, traverser, depth):
         # Node value = expectation under current strategy (player_side's perspective)
         node_value = sum(strategy.get(m, 0.0) * action_values[m] for m in moves)
 
-        # ---- Regret update ----
-        # For player_side: positive regret when an action beats the average.
-        # For opponent   : positive regret when an action lowers player_side's value
-        #                  (i.e., node_value - action_values[m] > 0).
-        if traverser == player_side:
-            for m in moves:
-                node.regret_sum[m] = (node.regret_sum.get(m, 0.0)
-                                      + action_values[m] - node_value)
-        else:
-            for m in moves:
-                node.regret_sum[m] = (node.regret_sum.get(m, 0.0)
-                                      + node_value - action_values[m])
-
-        # ---- Strategy sum update (for time-average strategy) ----
+        # ---- PCFR+ regret update ----
+        # Compute immediate (per-iteration) counterfactual regret, store as the
+        # prediction for the NEXT iteration, then apply RM+ clamping (R+ ≥ 0).
+        sign = 1.0 if traverser == player_side else -1.0
         for m in moves:
-            node.strategy_sum[m] = (node.strategy_sum.get(m, 0.0)
-                                    + strategy.get(m, 0.0))
+            imm = sign * (action_values[m] - node_value)
+            node.last_immediate_regret[m] = imm
+            node.regret_sum[m] = max(0.0, node.regret_sum.get(m, 0.0) + imm)
 
         node.visits += 1
         return node_value
@@ -848,14 +844,14 @@ def _cfr_traverse(node, player_side, traverser, depth):
 
 def cfr_in_world(root_board, player_side, num_iterations=10):
     """
-    External Sampling MCCFR with alternating updates in one determinized world.
+    External Sampling MCCFR with PCFR+ updates in one determinized world.
 
     Alternating updates (even t → player_side is the traverser, odd t → opponent)
-    have lower variance and faster practical convergence than updating a single
-    player every iteration.
+    reduce variance and accelerate practical convergence.
 
-    Returns {move: probability} – the time-average strategy at the root for
-    player_side's moves.  This average strategy converges to Nash equilibrium.
+    Returns {move: probability} – the *last-iterate* strategy at the root for
+    player_side's moves.  PCFR+ last iterates converge to Nash equilibrium
+    (no time-averaging required).
     """
     root = CFRNode(root_board, player_side)
     opp_side = 1 - player_side
@@ -864,21 +860,25 @@ def cfr_in_world(root_board, player_side, num_iterations=10):
         traverser = player_side if (t % 2 == 0) else opp_side
         _cfr_traverse(root, player_side, traverser, CFR_TREE_DEPTH)
 
-    return root.get_average_strategy()
+    # Last iterate: return the current strategy (not the time-average)
+    return root.get_strategy()
 
 
 def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
     """
-    IS-CFR (Information-Set CFR) over the full belief state.
+    IS-PCFR+ (Information-Set Predictive CFR+) over the full belief state.
 
     For each world sampled from the belief state, runs External Sampling MCCFR
-    to compute the time-average strategy.  Move probabilities are aggregated
-    across all worlds and the move with the highest combined probability is
-    returned.
+    with PCFR+ updates (PRM+ clamping + predictive strategy) to compute the
+    last-iterate strategy.  Move probabilities are aggregated across all worlds
+    and the move with the highest combined probability is returned.
 
-    Key difference from IS-GRAVE: instead of UCB-based (AMAF) selection, CFR
-    uses *regret matching*, which provides convergence-to-Nash guarantees and
-    typically yields stronger strategic decisions in imperfect-information games.
+    Key differences from IS-CFR:
+      - PRM+: cumulative regrets are clamped to ≥ 0 (no negative accumulation).
+      - Predictive strategy: each iteration's strategy is informed by the
+        immediate regret from the previous iteration (faster convergence).
+      - Last-iterate play: the current strategy is used directly, with no
+        time-averaging, giving stronger practical performance.
     """
     start_time = time.time()
 
@@ -923,7 +923,7 @@ def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
     elapsed = time.time() - start_time
     total_iters = worlds_processed * iterations_per_world
 
-    print(f"# IS-CFR: {worlds_processed} worlds, {total_iters} iterations, "
+    print(f"# IS-PCFR+: {worlds_processed} worlds, {total_iters} iterations, "
           f"{elapsed:.2f}s", flush=True)
     print(f"# Best move {sq_to_alg(best_move[0])}{sq_to_alg(best_move[1])}, "
           f"est strategy prob {best_score:.3f}", flush=True)
@@ -958,7 +958,7 @@ def draw_board(board):
 
 # Main engine loop (XBoard protocol)
 def main():
-    print("feature ping=1 myname=\"FoWMT v0.3 (IS-CFR)\" done=1", flush=True)
+    print("feature ping=1 myname=\"FoWMT v0.4 (IS-PCFR+)\" done=1", flush=True)
     observed_board = None
     player_side = None
     side_to_move = WHITE  # track which side is to move
