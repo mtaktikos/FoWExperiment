@@ -1163,6 +1163,7 @@ def main():
             continue
         elif cmd[0] == "new":
             # Los Alamos start position (6x6, no bishops)
+            # In FEN, '6' means six consecutive empty squares on that rank.
             initial_fen = "rnqknr/pppppp/6/6/PPPPPP/RNQKNR[] w - - 0 1"
             last_fen = initial_fen
             parsed = parse_extended_fen(initial_fen, player_side if player_side is not None else WHITE)
