@@ -142,7 +142,7 @@ def parse_extended_fen(fen, player_side):
             board[i] = 0  # default empty
 
 
-    rank = placement.count('/')
+    rank = BOARD_RANKS - 1
     file = 0
     for c in placement:
         if c == '/':
@@ -1163,7 +1163,7 @@ def main():
             continue
         elif cmd[0] == "new":
             # Los Alamos start position (6x6, no bishops)
-            initial_fen = "rnqknr/pppppp/6/6/PPPPPP/RNQKNR w - - 0 1"
+            initial_fen = "rnqknr/pppppp/6/6/PPPPPP/RNQKNR[] w - - 0 1"
             last_fen = initial_fen
             parsed = parse_extended_fen(initial_fen, player_side if player_side is not None else WHITE)
             observed_board = parsed[0]
