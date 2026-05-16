@@ -34,6 +34,12 @@ WHITE = 0
 BLACK = 1
 PIECE_CHARS = " PNBRQK"  # index 0 empty, 1-6 pieces
 
+# Los Alamos variant constants (6x6, no bishops)
+BOARD_FILES = 6
+BOARD_RANKS = 6
+PROMOTION_PIECES = [QUEEN, ROOK, KNIGHT]
+STANDARD_MATERIAL = {PAWN: 6, KNIGHT: 2, BISHOP: 0, ROOK: 2, QUEEN: 1, KING: 1}
+
 
 # Directions for pieces (0x88 board: rank*16 + file, so rank stride = 16)
 KNIGHT_DELTAS = [-33, -31, -18, -14, 14, 18, 31, 33]
@@ -66,7 +72,7 @@ PURIFIED_MAX_SUPPORT = 3   # maximum number of actions retained in the purified 
 
 # Board is 120-element array (0-119), with 0x88 off-board detection
 def on_board(sq):
-    return (sq & 0x88) == 0
+    return ((sq & 0x88) == 0) and ((sq & 7) < BOARD_FILES) and ((sq >> 4) < BOARD_RANKS)
 
 
 # Convert algebraic to 0x88 square
@@ -136,7 +142,7 @@ def parse_extended_fen(fen, player_side):
             board[i] = 0  # default empty
 
 
-    rank = 7
+    rank = placement.count('/')
     file = 0
     for c in placement:
         if c == '/':
@@ -169,6 +175,10 @@ def parse_extended_fen(fen, player_side):
 # Generate all pseudo-legal moves from a full board state
 def generate_moves(board, side):
     moves = []
+
+    def _is_visible_enemy(piece_value):
+        return piece_value != 0 and piece_value != FOG and ((piece_value > 0) != (side == WHITE))
+
     for sq in range(120):
         if not on_board(sq): continue
         piece = board[sq]
@@ -179,25 +189,21 @@ def generate_moves(board, side):
 
         if ptype == PAWN:
             dir = 16 if side == WHITE else -16
-            start_rank = 1 if side == WHITE else 6
-            rank = sq >> 4
+            promotion_rank = (BOARD_RANKS - 1) if side == WHITE else 0
             # single push
             tgt = sq + dir
             if on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG):
-                if rank == (6 if side == WHITE else 1):  # promotion rank (rank 7 for white, rank 2 for black)
-                    for prom in [QUEEN, ROOK, BISHOP, KNIGHT]:
+                if (tgt >> 4) == promotion_rank:
+                    for prom in PROMOTION_PIECES:
                         moves.append((sq, tgt, prom))
                 else:
                     moves.append((sq, tgt, 0))
-                # double push
-                if (rank == start_rank) and (board[tgt + dir] == 0 or board[tgt + dir] == FOG):
-                    moves.append((sq, tgt + dir, 0))
             # captures
             for cap_dir in [dir - 1, dir + 1]:
                 tgt = sq + cap_dir
-                if on_board(tgt) and board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE):
-                    if rank == (6 if side == WHITE else 1):
-                        for prom in [QUEEN, ROOK, BISHOP, KNIGHT]:
+                if on_board(tgt) and _is_visible_enemy(board[tgt]):
+                    if (tgt >> 4) == promotion_rank:
+                        for prom in PROMOTION_PIECES:
                             moves.append((sq, tgt, prom))
                     else:
                         moves.append((sq, tgt, 0))
@@ -235,19 +241,12 @@ def generate_moves(board, side):
                 tgt = sq + d
                 if on_board(tgt) and (board[tgt] == 0 or board[tgt] == FOG or (board[tgt] != 0 and board[tgt] != FOG and (board[tgt] > 0) != (side == WHITE))):
                     moves.append((sq, tgt, 0))
-            # Castling (simplified, ignore if rights lost or path blocked for now - can add later)
-            if side == WHITE:
-                if board[7] == ROOK * 1 and (board[5] == 0 or board[5] == FOG) and (board[6] == 0 or board[6] == FOG):  # kingside
-                    moves.append((sq, sq+2, 0))  # special, handle in make
-                if board[0] == ROOK * 1 and (board[1] == 0 or board[1] == FOG) and (board[2] == 0 or board[2] == FOG) and (board[3] == 0 or board[3] == FOG):  # queenside
-                    moves.append((sq, sq-2, 0))
-            else:
-                if board[119] == ROOK * -1 and (board[117] == 0 or board[117] == FOG) and (board[118] == 0 or board[118] == FOG):
-                    moves.append((sq, sq+2, 0))
-                if board[112] == ROOK * -1 and (board[113] == 0 or board[113] == FOG) and (board[114] == 0 or board[114] == FOG) and (board[115] == 0 or board[115] == FOG):
-                    moves.append((sq, sq-2, 0))
 
 
+    # Must-capture rule: if any visible enemy capture exists, non-captures are illegal.
+    capture_moves = [m for m in moves if _is_visible_enemy(board[m[1]])]
+    if capture_moves:
+        return capture_moves
     return moves
 
 
@@ -262,14 +261,6 @@ def make_move(board, move):
         new_board[to] = (abs(piece) // piece) * prom  # sign * prom type
     else:
         new_board[to] = piece
-    # simple castling
-    if abs(piece) == KING and abs(fr - to) == 2:
-        if to > fr:  # kingside: rook goes from to+1 (h-file) to to-1 (f-file)
-            new_board[to - 1] = new_board[to + 1]
-            new_board[to + 1] = 0
-        else:  # queenside: rook goes from to-2 (a-file) to to+1 (d-file)
-            new_board[to + 1] = new_board[to - 2]
-            new_board[to - 2] = 0
     return new_board, captured
 
 
@@ -314,9 +305,9 @@ def sample_worlds(observed_board, player_side, white_in_hand, black_in_hand, num
     fog_squares = [sq for sq in range(120) if on_board(sq) and (observed_board[sq] == 0 or observed_board[sq] == FOG)]
 
     # Calculate opponent pieces remaining using pieces in hand information
-    # Standard material: 8 pawns, 2 knights, 2 bishops, 2 rooks, 1 queen, 1 king
+    # Los Alamos material: 6 pawns, 2 knights, 0 bishops, 2 rooks, 1 queen, 1 king
     # Opponent pieces remaining = standard - (on_board + in_hand)
-    standard_material = {PAWN: 8, KNIGHT: 2, BISHOP: 2, ROOK: 2, QUEEN: 1, KING: 1}
+    standard_material = STANDARD_MATERIAL
     
     # Determine which pieces we captured from opponent
     our_hand = white_in_hand if player_side == WHITE else black_in_hand
@@ -504,7 +495,7 @@ def enumerate_worlds(observed_board, player_side, white_in_hand, black_in_hand,
     own_sign = 1 if player_side == WHITE else -1
     opp_sign = -own_sign
 
-    standard_material = {PAWN: 8, KNIGHT: 2, BISHOP: 2, ROOK: 2, QUEEN: 1, KING: 1}
+    standard_material = STANDARD_MATERIAL
 
     # Count opponent pieces that are directly visible on the observed board
     opp_on_board = {pt: 0 for pt in standard_material}
@@ -1117,12 +1108,13 @@ def belief_state_cfr(belief_state, observed_board, player_side, time_limit=5.0):
 
 # Draw the board in a human-readable format
 def draw_board(board):
-    """Draw the board from white's perspective (rank 8 at top)"""
+    """Draw the board from white's perspective (top rank at top)."""
     lines = []
-    lines.append("  +---+---+---+---+---+---+---+---+")
-    for rank in range(7, -1, -1):  # 8 to 1
+    border = "  +" + "---+" * BOARD_FILES
+    lines.append(border)
+    for rank in range(BOARD_RANKS - 1, -1, -1):
         row = f"{rank+1} |"
-        for file in range(8):  # a to h
+        for file in range(BOARD_FILES):
             sq = rank * 16 + file
             piece = board[sq]
             if piece == FOG:
@@ -1135,8 +1127,9 @@ def draw_board(board):
                 char = PIECE_CHARS[-piece].lower()
             row += f" {char} |"
         lines.append(row)
-        lines.append("  +---+---+---+---+---+---+---+---+")
-    lines.append("    a   b   c   d   e   f   g   h")
+        lines.append(border)
+    files_line = "    " + "   ".join(chr(ord('a') + i) for i in range(BOARD_FILES))
+    lines.append(files_line)
     return "\n".join(lines)
 
 
@@ -1169,12 +1162,15 @@ def main():
             # already sent features
             continue
         elif cmd[0] == "new":
-            # standard starting, but for FoW initial is own pieces visible, rest fog
-            initial_fen = "ffffffff/ffffffff/ffffffff/ffffffff/8/8/PPPPPPPP/RNBQKBNR[] w - - 0 1"
-            # To make initial fog, replace opponent ranks with f
-            if player_side is None:
-                # assume we play white first? but wait for color
-                pass
+            # Los Alamos start position (6x6, no bishops)
+            initial_fen = "rnqknr/pppppp/6/6/PPPPPP/RNQKNR w - - 0 1"
+            last_fen = initial_fen
+            parsed = parse_extended_fen(initial_fen, player_side if player_side is not None else WHITE)
+            observed_board = parsed[0]
+            side_to_move = parsed[1]
+            white_in_hand = parsed[6]
+            black_in_hand = parsed[7]
+            belief = None
         elif cmd[0] == "setboard":
             fen = " ".join(cmd[1:])
             last_fen = fen
